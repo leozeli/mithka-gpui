@@ -61,6 +61,7 @@ Checked against `gpui/assets/heroicons/outline/`. That directory is the only Her
 - `arrow-path`
 - `chat-bubble-left`
 - `check`
+- `chevron-left` — Back from the profile pane to the transcript (Heroicons v2.2.0 outline)
 - `folder`
 - `inbox`
 - `magnifying-glass` — search field above the chat list (Heroicons v2.2.0 outline)
@@ -71,6 +72,7 @@ Checked against `gpui/assets/heroicons/outline/`. That directory is the only Her
 - `rss`
 - `squares-2x2`
 - `trash`
+- `user-circle` — Profile in the chat header and on a Contacts row; also the P1 Private folder name (Heroicons v2.2.0 outline)
 - `user-group` — Contacts row in the groups column (Heroicons v2.2.0 outline)
 - `x-mark`
 
@@ -87,7 +89,6 @@ P0:
 - `arrow-uturn-right`
 - `bell`
 - `bell-slash`
-- `chevron-left`
 - `chevron-right`
 - `ellipsis-horizontal`
 - `face-smile`
@@ -116,7 +117,6 @@ P1 (names not already listed under P0):
 - `star`
 - `swatch`
 - `trophy`
-- `user-circle`
 
 P2 (names not already listed above):
 

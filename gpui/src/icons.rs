@@ -12,6 +12,7 @@ pub enum Icon {
     ArrowPath,
     ChatBubble,
     Check,
+    ChevronLeft,
     Folder,
     Inbox,
     MagnifyingGlass,
@@ -23,6 +24,7 @@ pub enum Icon {
     Rss,
     Squares,
     Trash,
+    UserCircle,
     UserGroup,
     /// Kept with the vendored set. The photo viewer uses the window title bar.
     #[allow(dead_code)]
@@ -35,6 +37,7 @@ impl Icon {
             Icon::ArrowPath => include_bytes!("../assets/heroicons/outline/arrow-path.svg"),
             Icon::ChatBubble => include_bytes!("../assets/heroicons/outline/chat-bubble-left.svg"),
             Icon::Check => include_bytes!("../assets/heroicons/outline/check.svg"),
+            Icon::ChevronLeft => include_bytes!("../assets/heroicons/outline/chevron-left.svg"),
             Icon::Folder => include_bytes!("../assets/heroicons/outline/folder.svg"),
             Icon::Inbox => include_bytes!("../assets/heroicons/outline/inbox.svg"),
             Icon::MagnifyingGlass => {
@@ -50,6 +53,7 @@ impl Icon {
             Icon::Rss => include_bytes!("../assets/heroicons/outline/rss.svg"),
             Icon::Squares => include_bytes!("../assets/heroicons/outline/squares-2x2.svg"),
             Icon::Trash => include_bytes!("../assets/heroicons/outline/trash.svg"),
+            Icon::UserCircle => include_bytes!("../assets/heroicons/outline/user-circle.svg"),
             Icon::UserGroup => include_bytes!("../assets/heroicons/outline/user-group.svg"),
             Icon::XMark => include_bytes!("../assets/heroicons/outline/x-mark.svg"),
         }

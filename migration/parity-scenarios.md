@@ -239,17 +239,50 @@ for pixel.
   conversation opens for that person. A `getContacts` or `createPrivateChat`
   error stays on the status line and does not close the session. All chats
   returns to the main chat list. A local group shows that group's nested
-  folders and chats.
+  folders and chats. Profile on a contact row opens that person's profile
+  (S14) and does not send `createPrivateChat`.
+
+### S14 — Profile
+
+- **id:** S14
+- **area:** profile (M12)
+- **steps:** Open a private chat. Click the title, the avatar, or Profile.
+  Read the name, `@username`, bio, phone when that number is visible, and
+  status. Press Back. Open a basic group, then a channel, the same way. In
+  Contacts, click Profile on a row, then Open chat.
+- **expected (Flutter / TDLib):** The conversation pane is replaced by the
+  profile. No fifth column appears. A private or secret peer sends `getUser`
+  and `getUserFullInfo`. A basic group sends `getBasicGroup` and
+  `getBasicGroupFullInfo`. A channel or other supergroup sends `getSupergroup`
+  and `getSupergroupFullInfo`. The open chat also sends `getChat`. The large
+  photo is `profile_photo.big`, or the largest `chatPhoto` size, via
+  `downloadFile`. Until that file is local, the avatar is initials or the
+  small photo already on the row. Phone is shown only when TDLib sends
+  `phone_number`. Status is online or last seen for a user, a member count
+  for a group, or a subscriber count for a channel. `updateUser`,
+  `updateUserFullInfo`, `updateUserStatus`, `updateBasicGroup`,
+  `updateBasicGroupFullInfo`, `updateSupergroup`, and `updateSupergroupFullInfo`
+  refresh the open profile. Back returns to the transcript. Message does the
+  same when that private chat is already open. Profile on a contact row does
+  not open the chat. Open chat does: `createPrivateChat` with `force` false
+  when no private chat is known yet, otherwise the existing chat. A profile
+  error stays on the status line (`Profile error <code>: <message>`) and does
+  not close the session. There is no gift store, QR, media gallery, block, or
+  edit-profile form.
+- **how to check on gpui:** Profile is the `user-circle` control. Back is
+  `chevron-left`. The pane shows a large avatar, the display name, `@username`
+  when TDLib has one, Group / Channel / Secret chat when that applies, the
+  status line, `Phone` plus the number when it is visible, and the bio or
+  description. Clicking the contact’s name or avatar still opens the chat
+  (S13). Choosing All chats, a local group, or Subscriptions leaves the
+  profile and shows that view’s conversation again.
 
 ## Upcoming
 
 These are not judge scenarios yet. They are named so a later pass does not
 treat them as already live.
 
-- **Profile page (M12, `next`).** This is the next module to kick. No profile
-  surface is in the live window. Scenarios for it wait until that module is
-  kicked.
 - **Settings shell and notifications (M13, `next`), then richer messaging
   (M14, `next`).** No settings or notification surface is in the live window.
-  Do not start them before profile. Scenarios wait until those modules are
-  kicked.
+  Profile is already S14. Scenarios for settings and notifications wait until
+  those modules are kicked.
