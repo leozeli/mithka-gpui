@@ -10,7 +10,7 @@
 //! http(s) entities, and `Input` plus a primary `Button` for the composer.
 //! All chats and Contacts hide the middle column. A local group shows only
 //! that group's nested Telegram folders there. Subscriptions uses it for feed
-//! sources. Subscriptions are local RSS/Atom items, not TDLib chats. The transcript itself is
+//! sources. A profile replaces the conversation pane until Back. Subscriptions are local RSS/Atom items, not TDLib chats. The transcript itself is
 //! GPUI's virtual list — the same list `MessageScroller` wraps — so a scroll
 //! to the first row can ask TDLib for an older page. `MessageScroller` does
 //! not expose that offset. Charts, docks, sidebars, tables, and forms from
@@ -34,7 +34,8 @@ use gpui_kit::{
 use mithka_rss::{store_path as subscriptions_path, FeedClient, FeedEvent, SubscriptionStore};
 use mithka_tdlib::{
     inspect_database, is_http_url, list_time, message_time, ChatItem, ContactItem, FolderItem,
-    LiveClient, MessageKind, SessionConfig, ShellCommand, TdJson, TextLink, TextMessage, UiUpdate,
+    LiveClient, MessageKind, Profile, ProfileKind, SessionConfig, ShellCommand, TdJson, TextLink,
+    TextMessage, UiUpdate,
 };
 use std::collections::HashSet;
 use std::io::Read;
@@ -310,6 +311,9 @@ struct ShellView {
     search_echo: String,
     show_contacts: bool,
     contacts: Vec<ContactItem>,
+    /// Profile replaces the conversation pane. The open chat stays selected.
+    show_profile: bool,
+    profile: Option<Profile>,
     pins: PinLibrary,
     /// Subscriptions replaces the folder, chat, and conversation columns.
     show_feeds: bool,
@@ -393,6 +397,8 @@ impl ShellView {
             search_echo: String::new(),
             show_contacts: false,
             contacts: Vec::new(),
+            show_profile: false,
+            profile: None,
             show_feeds: false,
             feeds: SubscriptionStore::load(feeds_path),
             feed_source: None,
@@ -513,6 +519,11 @@ impl ShellView {
                 self.search_hits = chats;
             }
             UiUpdate::Contacts(contacts) => self.contacts = contacts,
+            UiUpdate::Profile(profile) => {
+                if self.show_profile {
+                    self.profile = Some(profile);
+                }
+            }
             UiUpdate::OpenChat(chat_id) => {
                 self.open_chat = Some(chat_id);
                 self.convo_title = self
@@ -653,6 +664,7 @@ impl ShellView {
         if self.show_feeds {
             return;
         }
+        self.dismiss_profile();
         self.show_feeds = true;
         self.hide_contacts();
         self.group_id = None;
@@ -706,6 +718,7 @@ impl ShellView {
         _window: &mut Window,
         cx: &mut gpui_kit::Context<Self>,
     ) {
+        self.dismiss_profile();
         if let Some(contact) = self
             .contacts
             .iter()
@@ -714,6 +727,108 @@ impl ShellView {
             self.convo_title = contact.name.clone();
         }
         self.client.send(ShellCommand::OpenContact(user_id));
+        cx.notify();
+    }
+
+    fn dismiss_profile(&mut self) {
+        let was_open = self.show_profile;
+        self.show_profile = false;
+        if self.status == "Profile" || self.status == "Loading profile…" {
+            self.status = "Ready".into();
+        }
+        if was_open {
+            self.client.send(ShellCommand::CloseProfile);
+        }
+    }
+
+    fn show_chat_profile(&mut self, cx: &mut gpui_kit::Context<Self>) {
+        let Some(chat_id) = self.open_chat else {
+            return;
+        };
+        if !self.ready {
+            return;
+        }
+        let avatar = self
+            .chats
+            .iter()
+            .chain(self.search_hits.iter())
+            .find(|chat| chat.id == chat_id)
+            .and_then(|chat| chat.avatar.clone());
+        self.show_profile = true;
+        self.profile = Some(Profile {
+            kind: ProfileKind::Unknown,
+            chat_id: Some(chat_id),
+            user_id: 0,
+            title: self.convo_title.clone(),
+            username: String::new(),
+            about: String::new(),
+            phone: String::new(),
+            status: String::new(),
+            avatar,
+        });
+        self.status = "Loading profile…".into();
+        self.client.send(ShellCommand::OpenChatProfile(chat_id));
+        cx.notify();
+    }
+
+    fn show_user_profile(&mut self, user_id: i64, cx: &mut gpui_kit::Context<Self>) {
+        if !self.ready {
+            return;
+        }
+        let contact = self
+            .contacts
+            .iter()
+            .find(|contact| contact.user_id == user_id);
+        self.show_profile = true;
+        self.profile = Some(Profile {
+            kind: ProfileKind::User,
+            chat_id: None,
+            user_id,
+            title: contact
+                .map(|contact| contact.name.clone())
+                .unwrap_or_else(|| format!("User {user_id}")),
+            username: contact
+                .map(|contact| contact.username.clone())
+                .unwrap_or_default(),
+            about: String::new(),
+            phone: String::new(),
+            status: String::new(),
+            avatar: contact.and_then(|contact| contact.avatar.clone()),
+        });
+        self.status = "Loading profile…".into();
+        self.client.send(ShellCommand::OpenUserProfile(user_id));
+        cx.notify();
+    }
+
+    fn close_profile_view(&mut self, window: &mut Window, cx: &mut gpui_kit::Context<Self>) {
+        self.dismiss_profile();
+        if self.open_chat.is_some() {
+            self.composer.read(cx).focus_handle(cx).focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn run_profile_action(&mut self, window: &mut Window, cx: &mut gpui_kit::Context<Self>) {
+        let Some(profile) = self.profile.clone() else {
+            return;
+        };
+        let action = profile_action(&profile, self.open_chat);
+        self.dismiss_profile();
+        match action {
+            ProfileAction::Message => {
+                if self.open_chat.is_some() {
+                    self.composer.read(cx).focus_handle(cx).focus(window, cx);
+                }
+            }
+            ProfileAction::OpenChat => {
+                if let Some(chat_id) = profile.chat_id {
+                    self.open_chat(chat_id, window, cx);
+                } else if profile.user_id != 0 {
+                    self.open_contact(profile.user_id, window, cx);
+                }
+            }
+            ProfileAction::None => {}
+        }
         cx.notify();
     }
 
@@ -1103,6 +1218,7 @@ impl ShellView {
     }
 
     fn open_chat(&mut self, chat_id: i64, window: &mut Window, cx: &mut gpui_kit::Context<Self>) {
+        self.dismiss_profile();
         self.open_chat = Some(chat_id);
         self.convo_title = self
             .chats
@@ -1173,6 +1289,8 @@ impl Render for ShellView {
         };
         let detail = if self.show_feeds {
             self.article_pane(cx, border, muted).into_any_element()
+        } else if self.show_profile {
+            self.profile_pane(cx, border, muted).into_any_element()
         } else {
             self.conversation_pane(cx, can_send, border, muted)
                 .into_any_element()
@@ -1829,8 +1947,9 @@ impl ShellView {
         } else {
             format!("@{}", contact.username)
         };
+        let name = contact.name.clone();
+        let avatar = contact.avatar.clone();
         div()
-            .id(gpui_kit::SharedString::from(format!("contact-{user_id}")))
             .w_full()
             .flex()
             .items_center()
@@ -1838,40 +1957,65 @@ impl ShellView {
             .px_3()
             .py_2()
             .min_h(px(56.))
-            .cursor_pointer()
-            .hover(move |style| style.bg(hover))
-            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                this.open_contact(user_id, window, cx);
-            }))
-            .child(named_avatar(&contact.name, contact.avatar.as_deref()))
             .child(
-                v_flex()
+                div()
+                    .id(gpui_kit::SharedString::from(format!("contact-{user_id}")))
+                    .flex()
                     .flex_1()
                     .min_w_0()
-                    .gap_0p5()
+                    .items_center()
+                    .gap_2()
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(hover))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.open_contact(user_id, window, cx);
+                    }))
+                    .child(named_avatar(&name, avatar.as_deref()))
                     .child(
-                        div()
-                            .w_full()
+                        v_flex()
+                            .flex_1()
                             .min_w_0()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .child(contact.name.clone()),
-                    )
-                    .when(!username.is_empty(), |col| {
-                        col.child(
-                            div()
-                                .w_full()
-                                .min_w_0()
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .text_ellipsis()
-                                .text_size(px(12.))
-                                .text_color(muted)
-                                .child(username),
-                        )
-                    }),
+                            .gap_0p5()
+                            .child(
+                                div()
+                                    .w_full()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child(name),
+                            )
+                            .when(!username.is_empty(), |col| {
+                                col.child(
+                                    div()
+                                        .w_full()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .text_size(px(12.))
+                                        .text_color(muted)
+                                        .child(username),
+                                )
+                            }),
+                    ),
             )
+            .child(with_icon(
+                Icon::UserCircle,
+                muted,
+                Button::new(gpui_kit::SharedString::from(format!(
+                    "contact-profile-{user_id}"
+                )))
+                .ghost()
+                .small()
+                .label("Profile")
+                .disabled(!self.ready)
+                .on_click(cx.listener(
+                    move |this, _: &ClickEvent, _window, cx| {
+                        this.show_user_profile(user_id, cx);
+                    },
+                )),
+            ))
             .into_any_element()
     }
 
@@ -2345,6 +2489,14 @@ impl ShellView {
                 .into_any_element()
         };
 
+        let open_avatar = self.open_chat.and_then(|chat_id| {
+            self.chats
+                .iter()
+                .chain(self.search_hits.iter())
+                .find(|chat| chat.id == chat_id)
+                .map(|chat| avatar_for(chat).into_any_element())
+        });
+
         v_flex()
             .flex_1()
             .h_full()
@@ -2362,20 +2514,61 @@ impl ShellView {
                             .w_full()
                             .items_center()
                             .gap_2()
+                            .when(self.ready && self.open_chat.is_some(), |row| {
+                                let Some(avatar) = open_avatar else {
+                                    return row;
+                                };
+                                row.child(
+                                    div()
+                                        .id("open-profile-avatar")
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(
+                                            |this, _: &ClickEvent, _window, cx| {
+                                                this.show_chat_profile(cx);
+                                            },
+                                        ))
+                                        .child(avatar),
+                                )
+                            })
                             .child(
                                 div()
+                                    .id("open-profile-title")
                                     .flex_1()
                                     .min_w_0()
                                     .text_size(px(16.))
                                     .overflow_hidden()
                                     .whitespace_nowrap()
                                     .text_ellipsis()
+                                    .when(self.ready && self.open_chat.is_some(), |title| {
+                                        title.cursor_pointer().on_click(cx.listener(
+                                            |this, _: &ClickEvent, _window, cx| {
+                                                this.show_chat_profile(cx);
+                                            },
+                                        ))
+                                    })
                                     .child(self.convo_title.clone()),
                             )
                             .when(self.open_chat.is_some(), |row| {
                                 let pinned =
                                     self.open_chat.is_some_and(|id| self.pins.is_pinned(id));
                                 let label = if pinned { "Unpin" } else { "Pin" };
+                                let row = if self.ready {
+                                    row.child(with_icon(
+                                        Icon::UserCircle,
+                                        muted,
+                                        Button::new("open-profile")
+                                            .ghost()
+                                            .small()
+                                            .label("Profile")
+                                            .on_click(cx.listener(
+                                                |this, _: &ClickEvent, _window, cx| {
+                                                    this.show_chat_profile(cx);
+                                                },
+                                            )),
+                                    ))
+                                } else {
+                                    row
+                                };
                                 row.child(with_icon(
                                     Icon::MapPin,
                                     muted,
@@ -2419,6 +2612,134 @@ impl ShellView {
                     )),
             )
     }
+
+    fn profile_pane(
+        &self,
+        cx: &mut gpui_kit::Context<Self>,
+        border: gpui_kit::Hsla,
+        muted: gpui_kit::Hsla,
+    ) -> impl IntoElement {
+        let profile = self.profile.clone();
+        let action = profile
+            .as_ref()
+            .map(|profile| profile_action(profile, self.open_chat))
+            .unwrap_or(ProfileAction::None);
+        let action_label = match action {
+            ProfileAction::Message => Some("Message"),
+            ProfileAction::OpenChat => Some("Open chat"),
+            ProfileAction::None => None,
+        };
+        let body =
+            match profile {
+                Some(profile) => {
+                    let username = if profile.username.is_empty() {
+                        String::new()
+                    } else {
+                        format!("@{}", profile.username)
+                    };
+                    let kind = profile_kind_label(profile.kind);
+                    let about = profile_about_lines(&profile.about);
+                    let phone = profile.phone.clone();
+                    let status = profile.status.clone();
+                    v_flex()
+                        .w_full()
+                        .items_center()
+                        .gap_3()
+                        .child(
+                            named_avatar_px(&profile.title, profile.avatar.as_deref(), 72.)
+                                .into_any_element(),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .text_center()
+                                .text_size(px(20.))
+                                .whitespace_normal()
+                                .child(profile.title.clone()),
+                        )
+                        .when(!username.is_empty(), |col| {
+                            col.child(div().text_color(muted).child(username))
+                        })
+                        .when_some(kind, |col, kind| {
+                            col.child(div().text_color(muted).text_size(px(12.)).child(kind))
+                        })
+                        .when(!status.is_empty(), |col| {
+                            col.child(div().text_color(muted).child(status))
+                        })
+                        .when(!phone.is_empty(), |col| {
+                            col.child(div().child(format!("Phone {phone}")))
+                        })
+                        .when(!about.is_empty(), |col| {
+                            col.child(v_flex().w_full().gap_2().pt_2().children(
+                                about.into_iter().map(|line| {
+                                    div().w_full().whitespace_normal().child(line.to_string())
+                                }),
+                            ))
+                        })
+                        .into_any_element()
+                }
+                None => div()
+                    .text_color(muted)
+                    .child("Loading profile…")
+                    .into_any_element(),
+            };
+
+        v_flex()
+            .flex_1()
+            .h_full()
+            .min_w_0()
+            .child(
+                h_flex()
+                    .w_full()
+                    .px_4()
+                    .py_3()
+                    .gap_2()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(border)
+                    .child(with_icon(
+                        Icon::ChevronLeft,
+                        muted,
+                        Button::new("profile-back")
+                            .ghost()
+                            .small()
+                            .label("Back")
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.close_profile_view(window, cx);
+                            })),
+                    ))
+                    .child(div().text_size(px(16.)).child("Profile")),
+            )
+            .child(
+                div()
+                    .id("profile-body")
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .overflow_y_scrollbar()
+                    .p_4()
+                    .child(body),
+            )
+            .when_some(action_label, |pane, label| {
+                pane.child(
+                    h_flex()
+                        .w_full()
+                        .p_3()
+                        .border_t_1()
+                        .border_color(border)
+                        .child(with_icon(
+                            Icon::ChatBubble,
+                            muted,
+                            Button::new("profile-message")
+                                .primary()
+                                .label(label)
+                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                    this.run_profile_action(window, cx);
+                                })),
+                        )),
+                )
+            })
+    }
 }
 
 fn article_paragraphs(body: &str) -> Vec<String> {
@@ -2439,16 +2760,57 @@ fn column_title(title: &str, muted: gpui_kit::Hsla) -> impl IntoElement {
 }
 
 fn named_avatar(name: &str, path: Option<&str>) -> Avatar {
+    named_avatar_px(name, path, 36.)
+}
+
+fn named_avatar_px(name: &str, path: Option<&str>, size: f32) -> Avatar {
     let title = if name.is_empty() {
         "Untitled".to_string()
     } else {
         name.to_string()
     };
-    let mut avatar = Avatar::new().name(title).with_size(Size::Size(px(36.)));
+    let mut avatar = Avatar::new().name(title).with_size(Size::Size(px(size)));
     if let Some(path) = path.filter(|path| Path::new(path).is_file()) {
         avatar = avatar.src(PathBuf::from(path));
     }
     avatar
+}
+
+fn profile_kind_label(kind: ProfileKind) -> Option<&'static str> {
+    match kind {
+        ProfileKind::User | ProfileKind::Unknown => None,
+        ProfileKind::Secret => Some("Secret chat"),
+        ProfileKind::BasicGroup | ProfileKind::Supergroup => Some("Group"),
+        ProfileKind::Channel => Some("Channel"),
+    }
+}
+
+fn profile_about_lines(about: &str) -> Vec<&str> {
+    about
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProfileAction {
+    None,
+    /// The private chat is already open. Back to the transcript.
+    Message,
+    /// Open the private chat, creating it when this profile came from Contacts.
+    OpenChat,
+}
+
+fn profile_action(profile: &Profile, open_chat: Option<i64>) -> ProfileAction {
+    if !matches!(profile.kind, ProfileKind::User | ProfileKind::Secret) {
+        return ProfileAction::None;
+    }
+    if profile.chat_id.is_some() && profile.chat_id == open_chat {
+        ProfileAction::Message
+    } else {
+        ProfileAction::OpenChat
+    }
 }
 
 fn avatar_for(chat: &ChatItem) -> Avatar {
@@ -2898,7 +3260,11 @@ mod photo_fit_tests {
 
 #[cfg(test)]
 mod layout_tests {
-    use super::{middle_column, MiddleColumn};
+    use super::{
+        middle_column, profile_about_lines, profile_action, profile_kind_label, MiddleColumn,
+        ProfileAction,
+    };
+    use mithka_tdlib::{Profile, ProfileKind};
 
     #[test]
     fn all_chats_and_contacts_hide_the_folders_column() {
@@ -2917,4 +3283,47 @@ mod layout_tests {
         assert_eq!(middle_column(true, false, false), MiddleColumn::Feeds);
         assert_eq!(middle_column(true, true, true), MiddleColumn::Feeds);
     }
+
+    #[test]
+    fn profile_message_when_that_chat_is_open_otherwise_open_chat() {
+        let user = Profile {
+            kind: ProfileKind::User,
+            chat_id: Some(10),
+            user_id: 4,
+            title: "Ada".into(),
+            username: "ada".into(),
+            about: "Line one\n\nLine two".into(),
+            phone: "+15551212".into(),
+            status: "online".into(),
+            avatar: None,
+        };
+        assert_eq!(profile_action(&user, Some(10)), ProfileAction::Message);
+        assert_eq!(profile_action(&user, Some(11)), ProfileAction::OpenChat);
+        assert_eq!(profile_action(&user, None), ProfileAction::OpenChat);
+        let from_contacts = Profile {
+            chat_id: None,
+            ..user.clone()
+        };
+        assert_eq!(
+            profile_action(&from_contacts, None),
+            ProfileAction::OpenChat
+        );
+        let channel = Profile {
+            kind: ProfileKind::Channel,
+            user_id: 0,
+            username: "news".into(),
+            status: "2 subscribers".into(),
+            ..from_contacts
+        };
+        assert_eq!(profile_action(&channel, Some(30)), ProfileAction::None);
+        assert_eq!(profile_kind_label(ProfileKind::Channel), Some("Channel"));
+        assert_eq!(profile_kind_label(ProfileKind::BasicGroup), Some("Group"));
+        assert_eq!(profile_kind_label(ProfileKind::User), None);
+        assert_eq!(
+            profile_about_lines(&channel.about),
+            vec!["Line one", "Line two"]
+        );
+    }
 }
+
+// PORT STATUS: module=M12 confidence=high todos=0

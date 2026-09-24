@@ -9,8 +9,8 @@ M07	photo-hd-window	done	Photo opens in an independent HD window (WindowKind::Fl
 M08	sent-read-checks	done	Outgoing Sent/Read from last_read_outbox_message_id
 M09	heroicons-outline	done	Partial Heroicons outline set under gpui/assets/heroicons/outline. Solids not vendored yet
 M10	icons-md	done	icons.md is already on main. Link it from the rulebook. Do not rewrite it
-M11	contacts-search	done	Contacts list and global search MVP. Landed in 5e4f6bc. Next module to kick is M12 profile
-M12	profile	next	Profile page. This is the next module to kick
+M11	contacts-search	done	Contacts list and global search MVP. Landed in 5e4f6bc
+M12	profile	done	Profile pane for a private user, secret chat, basic group, or channel/supergroup. Replaces the conversation. Back returns to the chat
 M13	settings-notifications	next	Settings shell and notifications
 M14	messaging-rich	next	Thicken messaging: stickers, voice, reply, forward
 M15	stories	later	Stories

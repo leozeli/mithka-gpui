@@ -1,7 +1,8 @@
 //! Long-lived TDLib session shared by the desktop shells.
 //!
 //! The CLI driver exits after printing titles. This one stays open: it keeps
-//! the main chat list, loads text and photo history, and sends plain-text messages.
+//! the main chat list, loads text and photo history, sends plain-text messages,
+//! and loads a profile for a user, basic group, or channel.
 //! The receive loop runs on a background thread so the UI can own the main thread.
 
 use crate::driver::{
@@ -76,12 +77,50 @@ enum FileRole {
         message_id: i64,
         slot: PhotoSlot,
     },
+    /// Large user profile photo (`profile_photo.big` or the largest `chatPhoto`).
+    ProfileUser(i64),
+    /// Large chat photo for a group or channel profile.
+    ProfileChat(i64),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FolderItem {
     pub id: i32,
     pub title: String,
+}
+
+/// Which peer a profile pane is showing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProfileKind {
+    User,
+    Secret,
+    BasicGroup,
+    Supergroup,
+    Channel,
+    /// `getChat` has not named a peer type yet.
+    Unknown,
+}
+
+/// Snapshot for the profile pane. Empty strings mean TDLib has not sent that field.
+/// `phone` is set only when `user.phone_number` is non-empty (the number is visible).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Profile {
+    pub kind: ProfileKind,
+    /// Chat this profile belongs to, when one is already known.
+    pub chat_id: Option<i64>,
+    /// User id for a private or secret profile. `0` for groups and channels.
+    pub user_id: i64,
+    pub title: String,
+    /// Active username without a leading `@`.
+    pub username: String,
+    /// User bio, or the group/channel description.
+    pub about: String,
+    /// Phone with a leading `+` when TDLib omitted it. Empty when not visible.
+    pub phone: String,
+    /// Online line, or a member/subscriber count.
+    pub status: String,
+    /// Local path of the large profile photo, once `downloadFile` has finished.
+    pub avatar: Option<String>,
 }
 
 /// One row in the contacts panel. `username` is empty when TDLib has none.
@@ -100,6 +139,42 @@ struct ContactMeta {
     name: String,
     username: String,
     avatar: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChatPeer {
+    User(i64),
+    Secret(i64),
+    BasicGroup(i64),
+    Supergroup { id: i64, is_channel: bool },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProfileTarget {
+    User(i64),
+    Chat(i64),
+}
+
+#[derive(Clone, Debug, Default)]
+struct UserProfileCache {
+    username: String,
+    phone: String,
+    status: String,
+    avatar: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct BasicGroupCache {
+    member_count: Option<i32>,
+    description: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SuperGroupCache {
+    member_count: Option<i32>,
+    description: String,
+    username: String,
+    is_channel: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -163,6 +238,9 @@ pub enum UiUpdate {
     /// `createPrivateChat` returned a chat. The UI should select it, then the
     /// following [`UiUpdate::Conversation`] fills the transcript.
     OpenChat(i64),
+    /// The profile pane. Later updates refresh the same peer until
+    /// [`ShellCommand::CloseProfile`].
+    Profile(Profile),
     Fatal(String),
 }
 
@@ -185,6 +263,12 @@ pub enum ShellCommand {
     LoadContacts,
     /// `createPrivateChat`, then the same open path as [`ShellCommand::SelectChat`].
     OpenContact(i64),
+    /// Profile of this chat’s peer. Sends `getChat` and the full-info call for its type.
+    OpenChatProfile(i64),
+    /// Profile of a user, without opening a chat. Contacts uses this.
+    OpenUserProfile(i64),
+    /// The profile pane closed. Further updates are not pushed as [`UiUpdate::Profile`].
+    CloseProfile,
     Close,
 }
 
@@ -246,6 +330,19 @@ pub struct Shell {
     /// `getContacts` order. `updateUser` with `is_contact` inserts or removes.
     contact_ids: Vec<i64>,
     contact_meta: HashMap<i64, ContactMeta>,
+    /// Chat id → peer type from `chat.type`.
+    peers: HashMap<i64, ChatPeer>,
+    user_profiles: HashMap<i64, UserProfileCache>,
+    user_bios: HashMap<i64, String>,
+    basic_groups: HashMap<i64, BasicGroupCache>,
+    supergroups: HashMap<i64, SuperGroupCache>,
+    /// Large chat photo path, separate from the list’s small avatar.
+    chat_profile_photos: HashMap<i64, String>,
+    profile_target: Option<ProfileTarget>,
+    /// Full-info requests for the open profile have already been queued.
+    profile_details_sent: bool,
+    /// A profile request failed. Later successes must not clear that status line.
+    profile_failed: bool,
 }
 
 struct Effect {
@@ -289,6 +386,15 @@ impl Shell {
             search_ids: Vec::new(),
             contact_ids: Vec::new(),
             contact_meta: HashMap::new(),
+            peers: HashMap::new(),
+            user_profiles: HashMap::new(),
+            user_bios: HashMap::new(),
+            basic_groups: HashMap::new(),
+            supergroups: HashMap::new(),
+            chat_profile_photos: HashMap::new(),
+            profile_target: None,
+            profile_details_sent: false,
+            profile_failed: false,
         }
     }
 
@@ -311,6 +417,9 @@ impl Shell {
             ShellCommand::Search(query) => self.search(query),
             ShellCommand::LoadContacts => self.load_contacts(),
             ShellCommand::OpenContact(user_id) => self.open_contact(user_id),
+            ShellCommand::OpenChatProfile(chat_id) => self.open_chat_profile(chat_id),
+            ShellCommand::OpenUserProfile(user_id) => self.open_user_profile(user_id),
+            ShellCommand::CloseProfile => self.close_profile(),
         }
     }
 
@@ -352,6 +461,12 @@ impl Shell {
             "file" | "updateFile" => self.on_file(event),
             "chatFolders" | "updateChatFolders" => self.on_folders(event),
             "user" | "updateUser" => self.on_user(event),
+            "userFullInfo" | "updateUserFullInfo" => self.on_user_full_info(event),
+            "updateUserStatus" => self.on_user_status(event),
+            "basicGroup" | "updateBasicGroup" => self.on_basic_group(event),
+            "basicGroupFullInfo" | "updateBasicGroupFullInfo" => self.on_basic_group_full(event),
+            "supergroup" | "updateSupergroup" => self.on_supergroup(event),
+            "supergroupFullInfo" | "updateSupergroupFullInfo" => self.on_supergroup_full(event),
             "users" => self.on_users(event),
             "messages" => self.on_messages(event),
             "message" | "updateNewMessage" => self.on_message_event(event),
@@ -484,9 +599,25 @@ impl Shell {
                 UiUpdate::Status(format!("Could not open contact: {message}")),
             ]);
         }
+        if self.is_profile_error(extra) {
+            self.profile_failed = true;
+            let mut effect = Effect::ui(vec![
+                UiUpdate::Log(rendered),
+                UiUpdate::Status(format!("Profile error {code}: {message}")),
+            ]);
+            if let Some(update) = self.profile_snapshot() {
+                effect.ui.push(update);
+            }
+            return effect;
+        }
         if extra.starts_with("getChat:")
             || extra.starts_with("history:")
             || extra.starts_with("getUser:")
+            || extra.starts_with("getUserFullInfo:")
+            || extra.starts_with("getBasicGroup:")
+            || extra.starts_with("getBasicGroupFullInfo:")
+            || extra.starts_with("getSupergroup:")
+            || extra.starts_with("getSupergroupFullInfo:")
             || extra.starts_with("download:")
             || extra.starts_with("loadChats:folder:")
             || extra.starts_with("getChats:folder:")
@@ -670,6 +801,25 @@ impl Shell {
                 }
             }
         }
+        if let Some(id) = chat_id {
+            if self.viewing_chat(id) {
+                if !self.profile_details_sent {
+                    self.profile_details_sent = true;
+                    if let Some(peer) = self.peers.get(&id).copied() {
+                        effect.send.extend(peer_detail_requests(peer));
+                    }
+                }
+                self.note_chat_profile_photo(chat);
+                effect.send.extend(self.drain_sends());
+                if let Some(update) = self.profile_snapshot() {
+                    effect.ui.push(update);
+                }
+                let profile_fetch = extra.starts_with("getChat:profile:");
+                if profile_fetch && self.peers.get(&id).is_none() {
+                    self.finish_profile_status(&mut effect);
+                }
+            }
+        }
         effect
     }
 
@@ -701,6 +851,11 @@ impl Shell {
         let mut ui = vec![self.chat_list_update()];
         if self.open_chat == Some(id) {
             ui.push(self.conversation_update(id));
+        }
+        if self.viewing_chat(id) {
+            if let Some(update) = self.profile_snapshot() {
+                ui.push(update);
+            }
         }
         Effect::ui(ui)
     }
@@ -875,7 +1030,14 @@ impl Shell {
             if let Some(chat) = self.chats.get_mut(&id) {
                 chat.avatar = None;
             }
-            return Effect::ui(vec![self.chat_list_update()]);
+            self.chat_profile_photos.remove(&id);
+            let mut ui = vec![self.chat_list_update()];
+            if self.viewing_chat(id) {
+                if let Some(update) = self.profile_snapshot() {
+                    ui.push(update);
+                }
+            }
+            return Effect::ui(ui);
         }
         if let Some(chat) = self.chats.get_mut(&id) {
             chat.avatar = None;
@@ -883,8 +1045,18 @@ impl Shell {
         if let Some(file) = event.get("photo").and_then(|photo| photo.get("small")) {
             self.watch_file(file, FileRole::Avatar(id));
         }
+        if self.viewing_chat(id) {
+            if let Some(file) = event.get("photo").and_then(|photo| photo.get("big")) {
+                self.consider_profile_photo(file, FileRole::ProfileChat(id));
+            }
+        }
         let mut effect = Effect::send(self.drain_sends());
         effect.ui.push(self.chat_list_update());
+        if self.viewing_chat(id) {
+            if let Some(update) = self.profile_snapshot() {
+                effect.ui.push(update);
+            }
+        }
         effect
     }
 
@@ -901,8 +1073,38 @@ impl Shell {
             return Effect::none();
         }
         match role {
-            Some(FileRole::Avatar(_)) => Effect::ui(vec![self.chat_list_update()]),
-            Some(FileRole::ContactAvatar(_)) => Effect::ui(vec![self.contacts_update()]),
+            Some(FileRole::Avatar(chat_id)) => {
+                let mut effect = Effect::ui(vec![self.chat_list_update()]);
+                if self.viewing_chat(chat_id) {
+                    if let Some(update) = self.profile_snapshot() {
+                        effect.ui.push(update);
+                    }
+                }
+                effect
+            }
+            Some(FileRole::ContactAvatar(user_id)) => {
+                let mut effect = Effect::ui(vec![self.contacts_update()]);
+                if self.profile_touches_user(user_id) {
+                    if let Some(update) = self.profile_snapshot() {
+                        effect.ui.push(update);
+                    }
+                }
+                effect
+            }
+            Some(FileRole::ProfileUser(user_id)) => {
+                if self.profile_touches_user(user_id) {
+                    self.profile_effect()
+                } else {
+                    Effect::none()
+                }
+            }
+            Some(FileRole::ProfileChat(chat_id)) => {
+                if self.viewing_chat(chat_id) {
+                    self.profile_effect()
+                } else {
+                    Effect::none()
+                }
+            }
             Some(FileRole::MessagePhoto { chat_id, .. }) => self.maybe_conversation(chat_id),
             None => Effect::none(),
         }
@@ -917,6 +1119,7 @@ impl Shell {
             self.my_user_id = Some(id);
         }
         let contacts_changed = self.note_contact(user);
+        self.note_user_cache(user);
         let mut effect = Effect::send(self.drain_sends());
         if contacts_changed {
             effect.ui.push(self.contacts_update());
@@ -925,6 +1128,12 @@ impl Shell {
             if let Some(chat_id) = self.open_chat {
                 effect.ui.push(self.conversation_update(chat_id));
             }
+        }
+        if self.profile_touches_user(id) {
+            if let Some(update) = self.profile_snapshot() {
+                effect.ui.push(update);
+            }
+            self.finish_profile_status(&mut effect);
         }
         effect
     }
@@ -1188,6 +1397,7 @@ impl Shell {
         let Some(id) = json_i64(&chat["id"]) else {
             return false;
         };
+        self.note_peer(chat);
         let outbox_changed = json_i64(&chat["last_read_outbox_message_id"])
             .is_some_and(|message_id| self.note_outbox(id, message_id));
         let title = chat["title"].as_str().unwrap_or("…").to_string();
@@ -1438,6 +1648,23 @@ impl Shell {
                     changed = true;
                 }
                 changed
+            }
+            Some(FileRole::ProfileUser(user_id)) => {
+                let entry = self.user_profiles.entry(user_id).or_default();
+                if entry.avatar.as_deref() == Some(path) {
+                    false
+                } else {
+                    entry.avatar = Some(path.to_string());
+                    true
+                }
+            }
+            Some(FileRole::ProfileChat(chat_id)) => {
+                if self.chat_profile_photos.get(&chat_id).map(String::as_str) == Some(path) {
+                    false
+                } else {
+                    self.chat_profile_photos.insert(chat_id, path.to_string());
+                    true
+                }
             }
             None => false,
         }
@@ -1700,6 +1927,626 @@ impl Shell {
         } else {
             Effect::none()
         }
+    }
+
+    fn open_chat_profile(&mut self, chat_id: i64) -> Effect {
+        if !self.ready || self.failed {
+            return profile_unavailable();
+        }
+        self.profile_target = Some(ProfileTarget::Chat(chat_id));
+        self.profile_details_sent = false;
+        self.profile_failed = false;
+        let mut send = vec![get_chat_profile_request(chat_id)];
+        if let Some(peer) = self.peers.get(&chat_id).copied() {
+            self.profile_details_sent = true;
+            send.extend(peer_detail_requests(peer));
+        }
+        let mut effect = Effect::send(send);
+        if let Some(update) = self.profile_snapshot() {
+            effect.ui.push(update);
+        }
+        effect.ui.push(UiUpdate::Status("Loading profile…".into()));
+        effect
+    }
+
+    fn open_user_profile(&mut self, user_id: i64) -> Effect {
+        if !self.ready || self.failed {
+            return profile_unavailable();
+        }
+        self.profile_target = Some(ProfileTarget::User(user_id));
+        self.profile_details_sent = true;
+        self.profile_failed = false;
+        let mut effect = Effect::send(vec![
+            get_user_profile_request(user_id),
+            get_user_full_info_request(user_id),
+        ]);
+        if let Some(update) = self.profile_snapshot() {
+            effect.ui.push(update);
+        }
+        effect.ui.push(UiUpdate::Status("Loading profile…".into()));
+        effect
+    }
+
+    fn close_profile(&mut self) -> Effect {
+        self.profile_target = None;
+        self.profile_details_sent = false;
+        self.profile_failed = false;
+        Effect::none()
+    }
+
+    fn viewing_chat(&self, chat_id: i64) -> bool {
+        matches!(self.profile_target, Some(ProfileTarget::Chat(id)) if id == chat_id)
+    }
+
+    fn profile_touches_user(&self, user_id: i64) -> bool {
+        match self.profile_target {
+            Some(ProfileTarget::User(id)) => id == user_id,
+            Some(ProfileTarget::Chat(chat_id)) => matches!(
+                self.peers.get(&chat_id),
+                Some(ChatPeer::User(id) | ChatPeer::Secret(id)) if *id == user_id
+            ),
+            None => false,
+        }
+    }
+
+    fn profile_chat_for_basic(&self, group_id: i64) -> Option<i64> {
+        let ProfileTarget::Chat(chat_id) = self.profile_target? else {
+            return None;
+        };
+        match self.peers.get(&chat_id) {
+            Some(ChatPeer::BasicGroup(id)) if *id == group_id => Some(chat_id),
+            _ => None,
+        }
+    }
+
+    fn profile_chat_for_super(&self, group_id: i64) -> Option<i64> {
+        let ProfileTarget::Chat(chat_id) = self.profile_target? else {
+            return None;
+        };
+        match self.peers.get(&chat_id) {
+            Some(ChatPeer::Supergroup { id, .. }) if *id == group_id => Some(chat_id),
+            _ => None,
+        }
+    }
+
+    fn is_profile_error(&self, extra: &str) -> bool {
+        let Some(target) = self.profile_target else {
+            return false;
+        };
+        match target {
+            ProfileTarget::User(user_id) => {
+                extra == format!("getUser:profile:{user_id}")
+                    || extra == format!("getUserFullInfo:{user_id}")
+            }
+            ProfileTarget::Chat(chat_id) => {
+                if extra == format!("getChat:profile:{chat_id}") {
+                    return true;
+                }
+                match self.peers.get(&chat_id).copied() {
+                    Some(ChatPeer::User(id) | ChatPeer::Secret(id)) => {
+                        extra == format!("getUser:profile:{id}")
+                            || extra == format!("getUserFullInfo:{id}")
+                    }
+                    Some(ChatPeer::BasicGroup(id)) => {
+                        extra == format!("getBasicGroup:{id}")
+                            || extra == format!("getBasicGroupFullInfo:{id}")
+                    }
+                    Some(ChatPeer::Supergroup { id, .. }) => {
+                        extra == format!("getSupergroup:{id}")
+                            || extra == format!("getSupergroupFullInfo:{id}")
+                    }
+                    None => false,
+                }
+            }
+        }
+    }
+
+    fn note_peer(&mut self, chat: &Value) {
+        let Some(id) = json_i64(&chat["id"]) else {
+            return;
+        };
+        if let Some(peer) = chat_peer(&chat["type"]) {
+            self.peers.insert(id, peer);
+        }
+    }
+
+    fn note_user_cache(&mut self, user: &Value) {
+        let Some(id) = json_i64(&user["id"]) else {
+            return;
+        };
+        {
+            let entry = self.user_profiles.entry(id).or_default();
+            if user.get("usernames").is_some() || user.get("username").is_some() {
+                entry.username = user_username(user);
+            }
+            if user.get("phone_number").is_some() {
+                entry.phone = user["phone_number"]
+                    .as_str()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+            }
+            if let Some(status) = user.get("status").filter(|status| !status.is_null()) {
+                entry.status = format_user_status(status);
+            }
+        }
+        self.note_user_avatar(user);
+    }
+
+    fn note_user_avatar(&mut self, user: &Value) {
+        let Some(id) = json_i64(&user["id"]) else {
+            return;
+        };
+        let Some(photo) = user.get("profile_photo") else {
+            return;
+        };
+        if photo.is_null() {
+            if let Some(entry) = self.user_profiles.get_mut(&id) {
+                entry.avatar = None;
+            }
+            return;
+        }
+        let Some(file) = photo
+            .get("big")
+            .filter(|file| file.is_object())
+            .or_else(|| photo.get("small").filter(|file| file.is_object()))
+        else {
+            return;
+        };
+        if self.profile_touches_user(id) {
+            self.consider_profile_photo(file, FileRole::ProfileUser(id));
+        } else if let Some(path) = completed_local_path(file) {
+            self.user_profiles.entry(id).or_default().avatar = Some(path);
+        }
+    }
+
+    fn note_chat_profile_photo(&mut self, chat: &Value) {
+        let Some(id) = json_i64(&chat["id"]) else {
+            return;
+        };
+        if !self.viewing_chat(id) {
+            return;
+        }
+        let Some(photo) = chat.get("photo") else {
+            return;
+        };
+        if photo.is_null() {
+            self.chat_profile_photos.remove(&id);
+            return;
+        }
+        let Some(file) = photo
+            .get("big")
+            .filter(|file| file.is_object())
+            .or_else(|| photo.get("small").filter(|file| file.is_object()))
+        else {
+            return;
+        };
+        self.consider_profile_photo(file, FileRole::ProfileChat(id));
+    }
+
+    fn consider_profile_photo(&mut self, file: &Value, role: FileRole) {
+        let Some(id) = file_id(file) else {
+            return;
+        };
+        if let Some(path) = completed_local_path(file) {
+            self.store_profile_avatar(&role, &path);
+            return;
+        }
+        if self.file_roles.contains_key(&id) {
+            return;
+        }
+        self.watch_file(file, role);
+    }
+
+    fn store_profile_avatar(&mut self, role: &FileRole, path: &str) {
+        match role {
+            FileRole::ProfileUser(user_id) => {
+                self.user_profiles.entry(*user_id).or_default().avatar = Some(path.to_string());
+            }
+            FileRole::ProfileChat(chat_id) => {
+                self.chat_profile_photos.insert(*chat_id, path.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    fn on_user_full_info(&mut self, event: &Value) -> Effect {
+        let info = event.get("user_full_info").unwrap_or(event);
+        let extra = event["@extra"].as_str().unwrap_or("");
+        let Some(id) = json_i64(&event["user_id"]).or_else(|| extra_id(extra, "getUserFullInfo:"))
+        else {
+            return Effect::none();
+        };
+        if info.get("bio").is_some() {
+            let bio = info["bio"]["text"]
+                .as_str()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            self.user_bios.insert(id, bio);
+        }
+        if self.profile_touches_user(id) {
+            if let Some(file) = profile_chat_photo_file(info) {
+                self.consider_profile_photo(file, FileRole::ProfileUser(id));
+            }
+        } else if let Some(file) = profile_chat_photo_file(info) {
+            if let Some(path) = completed_local_path(file) {
+                self.user_profiles.entry(id).or_default().avatar = Some(path);
+            }
+        }
+        let mut effect = Effect::send(self.drain_sends());
+        if self.profile_touches_user(id) {
+            if let Some(update) = self.profile_snapshot() {
+                effect.ui.push(update);
+            }
+            self.finish_profile_status(&mut effect);
+        }
+        effect
+    }
+
+    fn on_user_status(&mut self, event: &Value) -> Effect {
+        let Some(id) = json_i64(&event["user_id"]) else {
+            return Effect::none();
+        };
+        let status = format_user_status(&event["status"]);
+        self.user_profiles.entry(id).or_default().status = status;
+        let mut effect = Effect::none();
+        if self.profile_touches_user(id) {
+            if let Some(update) = self.profile_snapshot() {
+                effect.ui.push(update);
+            }
+        }
+        effect
+    }
+
+    fn on_basic_group(&mut self, event: &Value) -> Effect {
+        let group = event.get("basic_group").unwrap_or(event);
+        let Some(id) = json_i64(&group["id"]) else {
+            return Effect::none();
+        };
+        if group.get("member_count").is_some() {
+            self.basic_groups.entry(id).or_default().member_count =
+                json_i32(&group["member_count"]);
+        }
+        self.group_profile_effect(self.profile_chat_for_basic(id))
+    }
+
+    fn on_basic_group_full(&mut self, event: &Value) -> Effect {
+        let info = event.get("basic_group_full_info").unwrap_or(event);
+        let extra = event["@extra"].as_str().unwrap_or("");
+        let Some(id) = json_i64(&event["basic_group_id"])
+            .or_else(|| extra_id(extra, "getBasicGroupFullInfo:"))
+        else {
+            return Effect::none();
+        };
+        {
+            let entry = self.basic_groups.entry(id).or_default();
+            if info.get("description").is_some() {
+                entry.description = info["description"]
+                    .as_str()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+            }
+            if entry.member_count.is_none() {
+                if let Some(members) = info["members"].as_array() {
+                    entry.member_count = i32::try_from(members.len()).ok();
+                }
+            }
+        }
+        if let Some(chat_id) = self.profile_chat_for_basic(id) {
+            if let Some(file) = profile_chat_photo_file(info) {
+                self.consider_profile_photo(file, FileRole::ProfileChat(chat_id));
+            }
+        }
+        let mut effect = Effect::send(self.drain_sends());
+        let refresh = self.group_profile_effect(self.profile_chat_for_basic(id));
+        effect.send.extend(refresh.send);
+        effect.ui.extend(refresh.ui);
+        effect
+    }
+
+    fn on_supergroup(&mut self, event: &Value) -> Effect {
+        let group = event.get("supergroup").unwrap_or(event);
+        let Some(id) = json_i64(&group["id"]) else {
+            return Effect::none();
+        };
+        let is_channel = group["is_channel"].as_bool();
+        {
+            let entry = self.supergroups.entry(id).or_default();
+            if group.get("member_count").is_some() {
+                entry.member_count = json_i32(&group["member_count"]);
+            }
+            if group.get("usernames").is_some() || group.get("username").is_some() {
+                entry.username = user_username(group);
+            }
+            if let Some(is_channel) = is_channel {
+                entry.is_channel = Some(is_channel);
+            }
+        }
+        if let Some(is_channel) = is_channel {
+            for peer in self.peers.values_mut() {
+                if let ChatPeer::Supergroup {
+                    id: group_id,
+                    is_channel: flag,
+                } = peer
+                {
+                    if *group_id == id {
+                        *flag = is_channel;
+                    }
+                }
+            }
+        }
+        self.group_profile_effect(self.profile_chat_for_super(id))
+    }
+
+    fn on_supergroup_full(&mut self, event: &Value) -> Effect {
+        let info = event.get("supergroup_full_info").unwrap_or(event);
+        let extra = event["@extra"].as_str().unwrap_or("");
+        let Some(id) =
+            json_i64(&event["supergroup_id"]).or_else(|| extra_id(extra, "getSupergroupFullInfo:"))
+        else {
+            return Effect::none();
+        };
+        {
+            let entry = self.supergroups.entry(id).or_default();
+            if info.get("description").is_some() {
+                entry.description = info["description"]
+                    .as_str()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+            }
+            if info.get("member_count").is_some() {
+                entry.member_count = json_i32(&info["member_count"]);
+            }
+        }
+        if let Some(chat_id) = self.profile_chat_for_super(id) {
+            if let Some(file) = profile_chat_photo_file(info) {
+                self.consider_profile_photo(file, FileRole::ProfileChat(chat_id));
+            }
+        }
+        let mut effect = Effect::send(self.drain_sends());
+        let refresh = self.group_profile_effect(self.profile_chat_for_super(id));
+        effect.send.extend(refresh.send);
+        effect.ui.extend(refresh.ui);
+        effect
+    }
+
+    fn group_profile_effect(&self, chat_id: Option<i64>) -> Effect {
+        let Some(chat_id) = chat_id else {
+            return Effect::none();
+        };
+        if !self.viewing_chat(chat_id) {
+            return Effect::none();
+        }
+        let mut effect = Effect::none();
+        if let Some(update) = self.profile_snapshot() {
+            effect.ui.push(update);
+        }
+        self.finish_profile_status(&mut effect);
+        effect
+    }
+
+    fn profile_effect(&self) -> Effect {
+        let mut effect = Effect::none();
+        if let Some(update) = self.profile_snapshot() {
+            effect.ui.push(update);
+        }
+        effect
+    }
+
+    fn finish_profile_status(&self, effect: &mut Effect) {
+        if self.profile_target.is_some() && !self.profile_failed {
+            effect.ui.push(UiUpdate::Status("Profile".into()));
+        }
+    }
+
+    fn profile_snapshot(&self) -> Option<UiUpdate> {
+        Some(UiUpdate::Profile(self.compose_profile()?))
+    }
+
+    fn compose_profile(&self) -> Option<Profile> {
+        match self.profile_target? {
+            ProfileTarget::User(user_id) => {
+                Some(self.compose_user(user_id, None, ProfileKind::User))
+            }
+            ProfileTarget::Chat(chat_id) => Some(self.compose_chat(chat_id)),
+        }
+    }
+
+    fn compose_chat(&self, chat_id: i64) -> Profile {
+        let fallback = self.chat_title(chat_id);
+        match self.peers.get(&chat_id).copied() {
+            Some(ChatPeer::User(user_id)) => {
+                self.compose_user_in_chat(user_id, chat_id, ProfileKind::User, &fallback)
+            }
+            Some(ChatPeer::Secret(user_id)) => {
+                self.compose_user_in_chat(user_id, chat_id, ProfileKind::Secret, &fallback)
+            }
+            Some(ChatPeer::BasicGroup(id)) => self.compose_basic_group(chat_id, id, &fallback),
+            Some(ChatPeer::Supergroup { id, is_channel }) => {
+                self.compose_supergroup(chat_id, id, is_channel, &fallback)
+            }
+            None => Profile {
+                kind: ProfileKind::Unknown,
+                chat_id: Some(chat_id),
+                user_id: 0,
+                title: fallback,
+                username: String::new(),
+                about: String::new(),
+                phone: String::new(),
+                status: String::new(),
+                avatar: self.chat_avatar(chat_id),
+            },
+        }
+    }
+
+    fn compose_user_in_chat(
+        &self,
+        user_id: i64,
+        chat_id: i64,
+        kind: ProfileKind,
+        fallback: &str,
+    ) -> Profile {
+        let mut profile = self.compose_user(user_id, Some(chat_id), kind);
+        if profile.title.starts_with("User ") && !fallback.is_empty() && fallback != "Profile" {
+            profile.title = fallback.to_string();
+        }
+        if profile.avatar.is_none() {
+            profile.avatar = self.chat_avatar(chat_id);
+        }
+        profile
+    }
+
+    fn compose_user(&self, user_id: i64, chat_id: Option<i64>, kind: ProfileKind) -> Profile {
+        let chat_id = chat_id.or_else(|| self.chat_for_user(user_id));
+        Profile {
+            kind,
+            chat_id,
+            user_id,
+            title: self.user_title(user_id),
+            username: self.user_username_of(user_id),
+            about: self.user_bios.get(&user_id).cloned().unwrap_or_default(),
+            phone: display_phone(
+                self.user_profiles
+                    .get(&user_id)
+                    .map(|cache| cache.phone.as_str())
+                    .unwrap_or(""),
+            ),
+            status: self
+                .user_profiles
+                .get(&user_id)
+                .map(|cache| cache.status.clone())
+                .unwrap_or_default(),
+            avatar: self
+                .user_avatar(user_id)
+                .or_else(|| chat_id.and_then(|chat_id| self.chat_avatar(chat_id))),
+        }
+    }
+
+    fn compose_basic_group(&self, chat_id: i64, group_id: i64, fallback: &str) -> Profile {
+        let cache = self.basic_groups.get(&group_id);
+        Profile {
+            kind: ProfileKind::BasicGroup,
+            chat_id: Some(chat_id),
+            user_id: 0,
+            title: fallback.to_string(),
+            username: String::new(),
+            about: cache
+                .map(|cache| cache.description.clone())
+                .unwrap_or_default(),
+            phone: String::new(),
+            status: cache
+                .and_then(|cache| cache.member_count)
+                .map(|count| member_line(count, false))
+                .unwrap_or_default(),
+            avatar: self.chat_avatar(chat_id),
+        }
+    }
+
+    fn compose_supergroup(
+        &self,
+        chat_id: i64,
+        group_id: i64,
+        is_channel: bool,
+        fallback: &str,
+    ) -> Profile {
+        let cache = self.supergroups.get(&group_id);
+        let channel = cache
+            .and_then(|cache| cache.is_channel)
+            .unwrap_or(is_channel);
+        Profile {
+            kind: if channel {
+                ProfileKind::Channel
+            } else {
+                ProfileKind::Supergroup
+            },
+            chat_id: Some(chat_id),
+            user_id: 0,
+            title: fallback.to_string(),
+            username: cache
+                .map(|cache| cache.username.clone())
+                .unwrap_or_default(),
+            about: cache
+                .map(|cache| cache.description.clone())
+                .unwrap_or_default(),
+            phone: String::new(),
+            status: cache
+                .and_then(|cache| cache.member_count)
+                .map(|count| member_line(count, channel))
+                .unwrap_or_default(),
+            avatar: self.chat_avatar(chat_id),
+        }
+    }
+
+    fn chat_title(&self, chat_id: i64) -> String {
+        self.chats
+            .get(&chat_id)
+            .map(|chat| chat.title.clone())
+            .filter(|title| !title.is_empty() && title != "…")
+            .unwrap_or_else(|| "Profile".into())
+    }
+
+    fn chat_for_user(&self, user_id: i64) -> Option<i64> {
+        let mut secret = None;
+        for (chat_id, peer) in &self.peers {
+            match peer {
+                ChatPeer::User(id) if *id == user_id => return Some(*chat_id),
+                ChatPeer::Secret(id) if *id == user_id => secret = Some(*chat_id),
+                _ => {}
+            }
+        }
+        secret
+    }
+
+    fn user_title(&self, user_id: i64) -> String {
+        if let Some(name) = self.users.get(&user_id) {
+            if !name.is_empty() {
+                return name.clone();
+            }
+        }
+        if let Some(meta) = self.contact_meta.get(&user_id) {
+            if !meta.name.is_empty() {
+                return meta.name.clone();
+            }
+        }
+        let username = self.user_username_of(user_id);
+        if !username.is_empty() {
+            return username;
+        }
+        format!("User {user_id}")
+    }
+
+    fn user_username_of(&self, user_id: i64) -> String {
+        if let Some(cache) = self.user_profiles.get(&user_id) {
+            if !cache.username.is_empty() {
+                return cache.username.clone();
+            }
+        }
+        self.contact_meta
+            .get(&user_id)
+            .map(|meta| meta.username.clone())
+            .unwrap_or_default()
+    }
+
+    fn user_avatar(&self, user_id: i64) -> Option<String> {
+        self.user_profiles
+            .get(&user_id)
+            .and_then(|cache| cache.avatar.clone())
+            .or_else(|| {
+                self.contact_meta
+                    .get(&user_id)
+                    .and_then(|meta| meta.avatar.clone())
+            })
+    }
+
+    fn chat_avatar(&self, chat_id: i64) -> Option<String> {
+        self.chat_profile_photos.get(&chat_id).cloned().or_else(|| {
+            self.chats
+                .get(&chat_id)
+                .and_then(|chat| chat.avatar.clone())
+        })
     }
 
     fn fail(&mut self, message: String) -> Effect {
@@ -2342,6 +3189,165 @@ fn get_user_request(user_id: i64) -> Value {
         "user_id": user_id,
         "@extra": format!("getUser:{user_id}")
     })
+}
+
+fn get_chat_profile_request(chat_id: i64) -> Value {
+    json!({
+        "@type": "getChat",
+        "chat_id": chat_id,
+        "@extra": format!("getChat:profile:{chat_id}")
+    })
+}
+
+fn get_user_profile_request(user_id: i64) -> Value {
+    json!({
+        "@type": "getUser",
+        "user_id": user_id,
+        "@extra": format!("getUser:profile:{user_id}")
+    })
+}
+
+fn get_user_full_info_request(user_id: i64) -> Value {
+    json!({
+        "@type": "getUserFullInfo",
+        "user_id": user_id,
+        "@extra": format!("getUserFullInfo:{user_id}")
+    })
+}
+
+fn get_basic_group_request(basic_group_id: i64) -> Value {
+    json!({
+        "@type": "getBasicGroup",
+        "basic_group_id": basic_group_id,
+        "@extra": format!("getBasicGroup:{basic_group_id}")
+    })
+}
+
+fn get_basic_group_full_info_request(basic_group_id: i64) -> Value {
+    json!({
+        "@type": "getBasicGroupFullInfo",
+        "basic_group_id": basic_group_id,
+        "@extra": format!("getBasicGroupFullInfo:{basic_group_id}")
+    })
+}
+
+fn get_supergroup_request(supergroup_id: i64) -> Value {
+    json!({
+        "@type": "getSupergroup",
+        "supergroup_id": supergroup_id,
+        "@extra": format!("getSupergroup:{supergroup_id}")
+    })
+}
+
+fn get_supergroup_full_info_request(supergroup_id: i64) -> Value {
+    json!({
+        "@type": "getSupergroupFullInfo",
+        "supergroup_id": supergroup_id,
+        "@extra": format!("getSupergroupFullInfo:{supergroup_id}")
+    })
+}
+
+fn peer_detail_requests(peer: ChatPeer) -> Vec<Value> {
+    match peer {
+        ChatPeer::User(id) | ChatPeer::Secret(id) => {
+            vec![get_user_profile_request(id), get_user_full_info_request(id)]
+        }
+        ChatPeer::BasicGroup(id) => vec![
+            get_basic_group_request(id),
+            get_basic_group_full_info_request(id),
+        ],
+        ChatPeer::Supergroup { id, .. } => vec![
+            get_supergroup_request(id),
+            get_supergroup_full_info_request(id),
+        ],
+    }
+}
+
+fn profile_unavailable() -> Effect {
+    Effect::ui(vec![UiUpdate::Status(
+        "Profile is available after TDLib is ready.".into(),
+    )])
+}
+
+fn chat_peer(kind: &Value) -> Option<ChatPeer> {
+    match kind["@type"].as_str()? {
+        "chatTypePrivate" => Some(ChatPeer::User(json_i64(&kind["user_id"])?)),
+        "chatTypeSecret" => Some(ChatPeer::Secret(json_i64(&kind["user_id"])?)),
+        "chatTypeBasicGroup" => Some(ChatPeer::BasicGroup(json_i64(&kind["basic_group_id"])?)),
+        "chatTypeSupergroup" => {
+            let id = json_i64(&kind["supergroup_id"])?;
+            let is_channel = kind["is_channel"].as_bool().unwrap_or(false);
+            Some(ChatPeer::Supergroup { id, is_channel })
+        }
+        _ => None,
+    }
+}
+
+fn extra_id(extra: &str, prefix: &str) -> Option<i64> {
+    extra.strip_prefix(prefix)?.parse().ok()
+}
+
+fn format_user_status(status: &Value) -> String {
+    match status["@type"].as_str() {
+        Some("userStatusOnline") => "online".into(),
+        Some("userStatusOffline") => {
+            let was_online = json_i64(&status["was_online"]).unwrap_or(0);
+            if was_online > 0 {
+                format!("last seen {}", crate::format::message_time(was_online))
+            } else {
+                "offline".into()
+            }
+        }
+        Some("userStatusRecently") => "last seen recently".into(),
+        Some("userStatusLastWeek") => "last seen within a week".into(),
+        Some("userStatusLastMonth") => "last seen within a month".into(),
+        _ => String::new(),
+    }
+}
+
+fn display_phone(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return String::new();
+    }
+    if raw.starts_with('+') {
+        raw.to_string()
+    } else if raw.chars().all(|ch| ch.is_ascii_digit()) {
+        format!("+{raw}")
+    } else {
+        raw.to_string()
+    }
+}
+
+fn member_line(count: i32, channel: bool) -> String {
+    let noun = if channel {
+        if count == 1 {
+            "subscriber"
+        } else {
+            "subscribers"
+        }
+    } else if count == 1 {
+        "member"
+    } else {
+        "members"
+    };
+    format!("{count} {noun}")
+}
+
+/// Largest size on a `chatPhoto`. Personal photo wins, then the public photo.
+fn profile_chat_photo_file(info: &Value) -> Option<&Value> {
+    for key in ["personal_photo", "photo", "public_photo"] {
+        let Some(photo) = info.get(key) else {
+            continue;
+        };
+        if photo.is_null() {
+            continue;
+        }
+        if let Some(file) = pick_full_size(photo).and_then(|size| size.get("photo")) {
+            return Some(file);
+        }
+    }
+    None
 }
 
 fn history_request(chat_id: i64, from_message_id: i64) -> Value {
@@ -4017,4 +5023,331 @@ mod tests {
             matches!(update, UiUpdate::Status(text) if text.contains("User not found"))
         }));
     }
+
+    fn profile_in(effect: &Effect) -> Profile {
+        effect
+            .ui
+            .iter()
+            .rev()
+            .find_map(|update| match update {
+                UiUpdate::Profile(profile) => Some(profile.clone()),
+                _ => None,
+            })
+            .expect("profile snapshot")
+    }
+
+    fn pending_file(id: i64) -> Value {
+        json!({
+            "@type": "file",
+            "id": id,
+            "local": {
+                "path": "",
+                "is_downloading_completed": false,
+                "can_be_downloaded": true
+            }
+        })
+    }
+
+    #[test]
+    fn profile_before_ready_is_a_status_line() {
+        let mut shell = Shell::new(cfg());
+        let effect = shell.on_command(ShellCommand::OpenChatProfile(1));
+        assert!(effect.send.is_empty());
+        assert!(effect.ui.iter().any(|update| {
+            matches!(update, UiUpdate::Status(text) if text.contains("after TDLib is ready"))
+        }));
+        assert!(!shell.failed);
+    }
+
+    #[test]
+    fn profile_for_user_group_and_channel() {
+        let mut shell = Shell::new(cfg());
+        ready(&mut shell);
+        drive(
+            &mut shell,
+            json!({
+                "@type": "updateNewChat",
+                "chat": {
+                    "@type": "chat",
+                    "id": 10,
+                    "title": "Ada Lovelace",
+                    "type": {"@type": "chatTypePrivate", "user_id": 4}
+                }
+            }),
+        );
+        let effect = shell.on_command(ShellCommand::OpenChatProfile(10));
+        assert!(effect.send.iter().any(|request| {
+            request["@type"] == "getChat" && request["@extra"] == "getChat:profile:10"
+        }));
+        assert!(effect.send.iter().any(|request| {
+            request["@type"] == "getUser"
+                && request["user_id"] == 4
+                && request["@extra"] == "getUser:profile:4"
+        }));
+        assert!(effect
+            .send
+            .iter()
+            .any(|request| { request["@type"] == "getUserFullInfo" && request["user_id"] == 4 }));
+        assert!(effect.ui.iter().any(|update| {
+            matches!(update, UiUpdate::Status(text) if text == "Loading profile…")
+        }));
+        assert!(!effect
+            .send
+            .iter()
+            .any(|request| request["@type"] == "logOut" || request["@type"] == "getChatFolders"));
+
+        let effect = drive(
+            &mut shell,
+            json!({
+                "@type": "user",
+                "id": 4,
+                "first_name": "Ada",
+                "last_name": "Lovelace",
+                "phone_number": "15551212",
+                "is_contact": true,
+                "status": {"@type": "userStatusOnline", "expires": 2_000_000_000},
+                "usernames": {
+                    "@type": "usernames",
+                    "active_usernames": ["ada"],
+                    "disabled_usernames": [],
+                    "editable_username": "ada"
+                },
+                "profile_photo": {
+                    "@type": "profilePhoto",
+                    "small": pending_file(21),
+                    "big": pending_file(22)
+                },
+                "@extra": "getUser:profile:4"
+            }),
+        );
+        assert!(effect
+            .send
+            .iter()
+            .any(|request| request["@type"] == "downloadFile" && request["file_id"] == 22));
+        let profile = profile_in(&effect);
+        assert_eq!(profile.kind, ProfileKind::User);
+        assert_eq!(profile.chat_id, Some(10));
+        assert_eq!(profile.user_id, 4);
+        assert_eq!(profile.title, "Ada Lovelace");
+        assert_eq!(profile.username, "ada");
+        assert_eq!(profile.phone, "+15551212");
+        assert_eq!(profile.status, "online");
+
+        let effect = drive(
+            &mut shell,
+            json!({
+                "@type": "file",
+                "id": 22,
+                "local": {"path": "/tmp/ada.jpg", "is_downloading_completed": true}
+            }),
+        );
+        assert_eq!(profile_in(&effect).avatar.as_deref(), Some("/tmp/ada.jpg"));
+
+        let effect = drive(
+            &mut shell,
+            json!({
+                "@type": "userFullInfo",
+                "bio": {"@type": "formattedText", "text": "Analyst"},
+                "@extra": "getUserFullInfo:4"
+            }),
+        );
+        assert_eq!(profile_in(&effect).about, "Analyst");
+        assert!(effect
+            .ui
+            .iter()
+            .any(|update| { matches!(update, UiUpdate::Status(text) if text == "Profile") }));
+
+        let effect = drive(
+            &mut shell,
+            json!({
+                "@type": "updateUserFullInfo",
+                "user_id": 4,
+                "user_full_info": {
+                    "@type": "userFullInfo",
+                    "bio": {"@type": "formattedText", "text": "Mathematician"}
+                }
+            }),
+        );
+        assert_eq!(profile_in(&effect).about, "Mathematician");
+
+        let effect = drive(
+            &mut shell,
+            json!({
+                "@type": "updateUserStatus",
+                "user_id": 4,
+                "status": {"@type": "userStatusRecently"}
+            }),
+        );
+        assert_eq!(profile_in(&effect).status, "last seen recently");
+
+        let effect = drive(
+            &mut shell,
+            json!({
+                "@type": "error",
+                "code": 400,
+                "message": "User not found",
+                "@extra": "getUserFullInfo:4"
+            }),
+        );
+        assert!(!shell.failed);
+        assert!(effect.ui.iter().any(|update| {
+            matches!(update, UiUpdate::Status(text) if text == "Profile error 400: User not found")
+        }));
+        assert!(!effect
+            .ui
+            .iter()
+            .any(|update| matches!(update, UiUpdate::Fatal(_))));
+
+        shell.on_command(ShellCommand::CloseProfile);
+        let effect = drive(
+            &mut shell,
+            json!({
+                "@type": "updateUserStatus",
+                "user_id": 4,
+                "status": {"@type": "userStatusLastWeek"}
+            }),
+        );
+        assert!(!effect
+            .ui
+            .iter()
+            .any(|update| matches!(update, UiUpdate::Profile(_))));
+
+        drive(
+            &mut shell,
+            json!({
+                "@type": "updateNewChat",
+                "chat": {
+                    "@type": "chat",
+                    "id": 20,
+                    "title": "Lab",
+                    "type": {"@type": "chatTypeBasicGroup", "basic_group_id": 7}
+                }
+            }),
+        );
+        let effect = shell.on_command(ShellCommand::OpenChatProfile(20));
+        assert!(effect
+            .send
+            .iter()
+            .any(|request| request["@type"] == "getBasicGroup" && request["basic_group_id"] == 7));
+        assert!(effect.send.iter().any(|request| {
+            request["@type"] == "getBasicGroupFullInfo" && request["basic_group_id"] == 7
+        }));
+        drive(
+            &mut shell,
+            json!({
+                "@type": "basicGroup",
+                "id": 7,
+                "member_count": 3,
+                "is_active": true,
+                "@extra": "getBasicGroup:7"
+            }),
+        );
+        let effect = drive(
+            &mut shell,
+            json!({
+                "@type": "basicGroupFullInfo",
+                "description": "Notes",
+                "members": [{"@type": "chatMember"}],
+                "@extra": "getBasicGroupFullInfo:7"
+            }),
+        );
+        let profile = profile_in(&effect);
+        assert_eq!(profile.kind, ProfileKind::BasicGroup);
+        assert_eq!(profile.title, "Lab");
+        assert_eq!(profile.about, "Notes");
+        assert_eq!(profile.status, "3 members");
+        assert!(profile.phone.is_empty());
+
+        drive(
+            &mut shell,
+            json!({
+                "@type": "updateNewChat",
+                "chat": {
+                    "@type": "chat",
+                    "id": 30,
+                    "title": "News",
+                    "type": {
+                        "@type": "chatTypeSupergroup",
+                        "supergroup_id": 9,
+                        "is_channel": true
+                    }
+                }
+            }),
+        );
+        let effect = shell.on_command(ShellCommand::OpenChatProfile(30));
+        assert!(effect
+            .send
+            .iter()
+            .any(|request| request["@type"] == "getSupergroup" && request["supergroup_id"] == 9));
+        assert!(effect.send.iter().any(|request| {
+            request["@type"] == "getSupergroupFullInfo" && request["supergroup_id"] == 9
+        }));
+        drive(
+            &mut shell,
+            json!({
+                "@type": "supergroup",
+                "id": 9,
+                "is_channel": true,
+                "member_count": 2,
+                "usernames": {"active_usernames": ["news"]},
+                "@extra": "getSupergroup:9"
+            }),
+        );
+        let effect = drive(
+            &mut shell,
+            json!({
+                "@type": "supergroupFullInfo",
+                "description": "Daily",
+                "member_count": 2,
+                "@extra": "getSupergroupFullInfo:9"
+            }),
+        );
+        let profile = profile_in(&effect);
+        assert_eq!(profile.kind, ProfileKind::Channel);
+        assert_eq!(profile.title, "News");
+        assert_eq!(profile.username, "news");
+        assert_eq!(profile.about, "Daily");
+        assert_eq!(profile.status, "2 subscribers");
+
+        let effect = shell.on_command(ShellCommand::OpenUserProfile(4));
+        assert!(effect
+            .send
+            .iter()
+            .any(|request| request["@type"] == "getUserFullInfo" && request["user_id"] == 4));
+        assert!(!effect
+            .send
+            .iter()
+            .any(|request| request["@type"] == "createPrivateChat"));
+        let profile = profile_in(&effect);
+        assert_eq!(profile.kind, ProfileKind::User);
+        assert_eq!(profile.user_id, 4);
+        assert_eq!(profile.chat_id, Some(10));
+        assert_eq!(profile.phone, "+15551212");
+
+        drive(
+            &mut shell,
+            json!({
+                "@type": "updateNewChat",
+                "chat": {
+                    "@type": "chat",
+                    "id": 40,
+                    "title": "Whisper",
+                    "type": {"@type": "chatTypeSecret", "secret_chat_id": 3, "user_id": 8}
+                }
+            }),
+        );
+        let effect = shell.on_command(ShellCommand::OpenChatProfile(40));
+        assert!(effect.send.iter().any(|request| {
+            request["@type"] == "getUser"
+                && request["user_id"] == 8
+                && request["@extra"] == "getUser:profile:8"
+        }));
+        assert!(effect
+            .send
+            .iter()
+            .any(|request| request["@type"] == "getUserFullInfo" && request["user_id"] == 8));
+        assert_eq!(profile_in(&effect).kind, ProfileKind::Secret);
+    }
 }
+
+// PORT STATUS: module=M12 confidence=high todos=0
