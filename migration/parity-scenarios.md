@@ -191,14 +191,58 @@ for pixel.
   Read also draws the `check` glyph. Incoming mark-read stays the `viewMessages`
   path from S03.
 
+### S12 — Global search
+
+- **id:** S12
+- **area:** contacts-search (M11)
+- **steps:** From All chats, type a substring of a title that is already in
+  the visible list. Clear it. Type a query that is not only that substring
+  (a known chat's username, or an `@username`). Click one result. Open
+  Subscriptions.
+- **expected (Flutter / TDLib):** The visible list filters by title substring
+  as the query changes. Folder and local-group selection still decide which
+  chats are in that visible set. A non-empty query also sends `searchChats`
+  and `searchChatsOnServer`. TDLib 1.8.67 requires `type_filter` on both;
+  the client sends null. An `@username`, or one username-shaped token, also
+  sends `searchPublicChats` with `query` (not `username_prefix`) and the same
+  null `type_filter`. That method omits chats already in the chat list.
+  Results are unique. Clicking one opens that chat (`openChat`, same path as
+  S03). In Subscriptions, chat search does not run.
+- **how to check on gpui:** The field is above the chat list. The
+  magnifying-glass icon focuses it. Title matches update immediately. Hits
+  that were not already visible appear under “Also found”. A click opens the
+  conversation. Subscriptions hides the field and shows “Chat search is off
+  in Subscriptions.” A search error stays on the status line.
+
+### S13 — Contacts list
+
+- **id:** S13
+- **area:** contacts-search (M11)
+- **steps:** In the groups column, click Contacts. Read the list. Click a
+  contact. Then click All chats, or a Telegram folder.
+- **expected (Flutter / TDLib):** Opening the list sends `getContacts`.
+  `updateUser` keeps it current (`is_contact` adds or removes a row;
+  `usernames.active_usernames` is the `@username`; `profile_photo.small` is
+  the avatar once `downloadFile` has a local path). A click sends
+  `createPrivateChat` with `force` false, then opens that private chat
+  (same `openChat` path as S03). There is no add-by-phone form. Choosing All
+  chats or a folder leaves the contacts list and shows chats again.
+- **how to check on gpui:** The row is Contacts, with the `user-group` icon.
+  Each row is an avatar (initials until the small photo is local), a display
+  name, and `@username` when TDLib has one. The conversation opens for that
+  person. A `getContacts` or `createPrivateChat` error stays on the status
+  line and does not close the session. All chats or a folder returns to the
+  chat list.
+
 ## Upcoming
 
 These are not judge scenarios yet. They are named so a later pass does not
 treat them as already live.
 
-- **Contacts and global search (M11, `in_progress`).** Another agent owns the
-  implementation. Do not add search or contact scenarios here until that work
-  lands and a human moves the manifest row to `done`.
-- **Profile page (M12, `next`) and settings shell plus notifications (M13,
-  `next`).** No profile or settings surface is in the live window. Scenarios
-  for them wait until those modules are kicked.
+- **Profile page (M12, `next`).** This is the next module to kick. No profile
+  surface is in the live window. Scenarios for it wait until that module is
+  kicked.
+- **Settings shell and notifications (M13, `next`), then richer messaging
+  (M14, `next`).** No settings or notification surface is in the live window.
+  Do not start them before profile. Scenarios wait until those modules are
+  kicked.
