@@ -19,6 +19,10 @@ kit repo. This folder does not vendor them.
 Icon names already live at the repo root in [`icons.md`](../icons.md). That
 file is on `main`. Link it. Do not rewrite it from a migration pass.
 
+Desktop UI inspiration for the live three-pane shell, conversation, and RSS
+timeline is in [`design-refs.md`](design-refs.md). Those links do not add an
+icon stack. Implementation stays Heroicons plus gpui-kit.
+
 ## How the files map onto steps 0–6
 
 | Step | Kit prompt | What this folder holds |
