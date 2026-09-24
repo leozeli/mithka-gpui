@@ -63,6 +63,7 @@ Checked against `gpui/assets/heroicons/outline/`. That directory is the only Her
 - `check`
 - `folder`
 - `inbox`
+- `magnifying-glass` — search field above the chat list (Heroicons v2.2.0 outline)
 - `paper-airplane`
 - `pencil`
 - `photo`
@@ -70,6 +71,7 @@ Checked against `gpui/assets/heroicons/outline/`. That directory is the only Her
 - `rss`
 - `squares-2x2`
 - `trash`
+- `user-group` — Contacts row in the groups column (Heroicons v2.2.0 outline)
 - `x-mark`
 
 ### Already vendored, not on this checklist
@@ -90,7 +92,6 @@ P0:
 - `ellipsis-horizontal`
 - `face-smile`
 - `link`
-- `magnifying-glass`
 - `microphone`
 - `paper-clip`
 
@@ -116,7 +117,6 @@ P1 (names not already listed under P0):
 - `swatch`
 - `trophy`
 - `user-circle`
-- `user-group`
 
 P2 (names not already listed above):
 

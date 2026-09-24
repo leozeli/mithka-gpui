@@ -70,6 +70,7 @@ enum PhotoSlot {
 #[derive(Clone, Debug)]
 enum FileRole {
     Avatar(i64),
+    ContactAvatar(i64),
     MessagePhoto {
         chat_id: i64,
         message_id: i64,
@@ -81,6 +82,24 @@ enum FileRole {
 pub struct FolderItem {
     pub id: i32,
     pub title: String,
+}
+
+/// One row in the contacts panel. `username` is empty when TDLib has none.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContactItem {
+    pub user_id: i64,
+    pub name: String,
+    /// Active username without a leading `@`.
+    pub username: String,
+    /// Local path of `profile_photo.small`, once that file has downloaded.
+    pub avatar: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ContactMeta {
+    name: String,
+    username: String,
+    avatar: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -133,6 +152,17 @@ pub enum UiUpdate {
     },
     /// Telegram chat folders. The main list is not included; the UI adds All.
     Folders(Vec<FolderItem>),
+    /// Chats returned for one search query. The UI merges these with the
+    /// folder-filtered list; this does not replace [`UiUpdate::ChatList`].
+    SearchResults {
+        query: String,
+        chats: Vec<ChatItem>,
+    },
+    /// Full contact list, in `getContacts` order, refreshed from `updateUser`.
+    Contacts(Vec<ContactItem>),
+    /// `createPrivateChat` returned a chat. The UI should select it, then the
+    /// following [`UiUpdate::Conversation`] fills the transcript.
+    OpenChat(i64),
     Fatal(String),
 }
 
@@ -149,6 +179,12 @@ pub enum ShellCommand {
     LoadOlder {
         chat_id: i64,
     },
+    /// Global chat search. An empty query clears remote hits.
+    Search(String),
+    /// `getContacts`. Later `updateUser` events keep the list current.
+    LoadContacts,
+    /// `createPrivateChat`, then the same open path as [`ShellCommand::SelectChat`].
+    OpenContact(i64),
     Close,
 }
 
@@ -199,6 +235,17 @@ pub struct Shell {
     history_exhausted: HashSet<i64>,
     /// `chat.last_read_outbox_message_id` / `updateChatReadOutbox`.
     last_read_outbox: HashMap<i64, i64>,
+    /// Trimmed query of the in-flight global search. Empty means no search.
+    search_query: String,
+    search_gen: u64,
+    /// How many search responses are still outstanding for `search_gen`.
+    search_pending: u8,
+    search_error: bool,
+    /// Chat ids for `search_query`, in the order replies arrived, unique.
+    search_ids: Vec<i64>,
+    /// `getContacts` order. `updateUser` with `is_contact` inserts or removes.
+    contact_ids: Vec<i64>,
+    contact_meta: HashMap<i64, ContactMeta>,
 }
 
 struct Effect {
@@ -235,6 +282,13 @@ impl Shell {
             history_from: HashMap::new(),
             history_exhausted: HashSet::new(),
             last_read_outbox: HashMap::new(),
+            search_query: String::new(),
+            search_gen: 0,
+            search_pending: 0,
+            search_error: false,
+            search_ids: Vec::new(),
+            contact_ids: Vec::new(),
+            contact_meta: HashMap::new(),
         }
     }
 
@@ -254,6 +308,9 @@ impl Shell {
                 Effect::send(vec![send_text_request(chat_id, &text)])
             }
             ShellCommand::SelectFolder(folder) => self.select_folder(folder),
+            ShellCommand::Search(query) => self.search(query),
+            ShellCommand::LoadContacts => self.load_contacts(),
+            ShellCommand::OpenContact(user_id) => self.open_contact(user_id),
         }
     }
 
@@ -295,6 +352,7 @@ impl Shell {
             "file" | "updateFile" => self.on_file(event),
             "chatFolders" | "updateChatFolders" => self.on_folders(event),
             "user" | "updateUser" => self.on_user(event),
+            "users" => self.on_users(event),
             "messages" => self.on_messages(event),
             "message" | "updateNewMessage" => self.on_message_event(event),
             "updateMessageContent" => self.on_message_content(event),
@@ -402,6 +460,30 @@ impl Shell {
                 self.history_from.remove(&chat_id);
             }
         }
+        if let Some(gen) = search_generation(extra) {
+            let current = gen == self.search_gen;
+            if current {
+                self.search_error = true;
+            }
+            self.note_search_done(gen);
+            let mut ui = vec![UiUpdate::Log(rendered)];
+            if current {
+                ui.push(UiUpdate::Status(format!("Search error {code}: {message}")));
+            }
+            return Effect::ui(ui);
+        }
+        if extra == "getContacts" {
+            return Effect::ui(vec![
+                UiUpdate::Log(rendered),
+                UiUpdate::Status(format!("Contacts error {code}: {message}")),
+            ]);
+        }
+        if extra.starts_with("createPrivateChat:") {
+            return Effect::ui(vec![
+                UiUpdate::Log(rendered),
+                UiUpdate::Status(format!("Could not open contact: {message}")),
+            ]);
+        }
         if extra.starts_with("getChat:")
             || extra.starts_with("history:")
             || extra.starts_with("getUser:")
@@ -442,6 +524,9 @@ impl Shell {
         let extra = event["@extra"].as_str().unwrap_or("");
         if let Some(folder_id) = extra.strip_prefix("getChats:folder:") {
             return self.on_folder_chats(folder_id, event);
+        }
+        if let Some(gen) = search_generation(extra) {
+            return self.on_search_chats(gen, event);
         }
         let mut ids = Vec::new();
         if let Some(arr) = event["chat_ids"].as_array() {
@@ -540,7 +625,10 @@ impl Shell {
     }
 
     fn on_chat_event(&mut self, event: &Value) -> Effect {
+        let extra = event["@extra"].as_str().unwrap_or("").to_string();
         let chat = event.get("chat").unwrap_or(event);
+        let chat_id = json_i64(&chat["id"]);
+        let was_listed = chat_id.is_some_and(|id| self.listed.contains(&id));
         let outbox_changed = if chat["@type"].as_str() == Some("chat")
             || event["@type"].as_str() == Some("updateNewChat")
         {
@@ -548,16 +636,56 @@ impl Shell {
         } else {
             false
         };
+        if extra.starts_with("getChat:search:") {
+            if let Some(id) = chat_id {
+                self.detach_unlisted_search_chat(id, was_listed);
+            }
+        }
         let mut effect = Effect::send(self.drain_sends());
         effect.ui.push(self.chat_list_update());
-        if outbox_changed {
-            if let Some(id) = json_i64(&chat["id"]) {
-                if self.open_chat == Some(id) {
-                    effect.ui.push(self.conversation_update(id));
+        if let Some(id) = chat_id {
+            if !self.search_query.is_empty() && self.search_ids.contains(&id) {
+                effect.ui.push(self.search_update());
+                if self.search_pending == 0 && !self.search_error {
+                    effect
+                        .ui
+                        .push(UiUpdate::Status(search_status(self.search_chats().len())));
+                }
+            }
+            if outbox_changed && self.open_chat == Some(id) {
+                effect.ui.push(self.conversation_update(id));
+            }
+        }
+        if extra
+            .strip_prefix("createPrivateChat:")
+            .is_some_and(|rest| rest.parse::<i64>().is_ok())
+        {
+            if let Some(id) = chat_id {
+                let opened = self.select_chat(id);
+                effect.send.extend(opened.send);
+                effect.ui.insert(0, UiUpdate::OpenChat(id));
+                effect.ui.extend(opened.ui);
+                if self.ready {
+                    effect.ui.push(UiUpdate::Status("Ready".into()));
                 }
             }
         }
         effect
+    }
+
+    /// A search hit that was not already on a chat list stays out of All chats.
+    fn detach_unlisted_search_chat(&mut self, id: i64, was_listed: bool) {
+        if was_listed {
+            return;
+        }
+        let on_main = self
+            .chats
+            .get(&id)
+            .is_some_and(|chat| chat.real_order && chat.order != 0);
+        if on_main || self.chat_in_some_folder(id) {
+            return;
+        }
+        self.listed.retain(|chat_id| *chat_id != id);
     }
 
     fn on_title(&mut self, event: &Value) -> Effect {
@@ -774,6 +902,7 @@ impl Shell {
         }
         match role {
             Some(FileRole::Avatar(_)) => Effect::ui(vec![self.chat_list_update()]),
+            Some(FileRole::ContactAvatar(_)) => Effect::ui(vec![self.contacts_update()]),
             Some(FileRole::MessagePhoto { chat_id, .. }) => self.maybe_conversation(chat_id),
             None => Effect::none(),
         }
@@ -784,18 +913,116 @@ impl Shell {
         let Some(id) = json_i64(&user["id"]) else {
             return Effect::none();
         };
-        let name = user_name(user);
-        if name.is_empty() {
-            return Effect::none();
-        }
         if event["@extra"].as_str() == Some("getMe") {
             self.my_user_id = Some(id);
         }
-        self.users.insert(id, name);
-        if let Some(chat_id) = self.open_chat {
-            return Effect::ui(vec![self.conversation_update(chat_id)]);
+        let contacts_changed = self.note_contact(user);
+        let mut effect = Effect::send(self.drain_sends());
+        if contacts_changed {
+            effect.ui.push(self.contacts_update());
         }
-        Effect::none()
+        if self.users.contains_key(&id) {
+            if let Some(chat_id) = self.open_chat {
+                effect.ui.push(self.conversation_update(chat_id));
+            }
+        }
+        effect
+    }
+
+    fn on_users(&mut self, event: &Value) -> Effect {
+        if event["@extra"].as_str() != Some("getContacts") {
+            return Effect::none();
+        }
+        let mut ids = Vec::new();
+        if let Some(arr) = event["user_ids"].as_array() {
+            for id in arr {
+                if let Some(id) = json_i64(id) {
+                    ids.push(id);
+                }
+            }
+        }
+        self.contact_ids = ids;
+        self.contact_meta
+            .retain(|id, _| self.contact_ids.contains(id));
+        let missing: Vec<i64> = self
+            .contact_ids
+            .iter()
+            .copied()
+            .filter(|id| !self.contact_meta.contains_key(id))
+            .collect();
+        let mut effect = Effect::send(missing.into_iter().map(get_user_request).collect());
+        effect.ui.push(self.contacts_update());
+        effect.ui.push(UiUpdate::Status(format!(
+            "{} contacts",
+            self.contact_ids.len()
+        )));
+        effect
+    }
+
+    /// Returns whether the contact list changed. Also queues a small-photo download.
+    fn note_contact(&mut self, user: &Value) -> bool {
+        let Some(id) = json_i64(&user["id"]) else {
+            return false;
+        };
+        let name = user_name(user);
+        if !name.is_empty() {
+            self.users.insert(id, name.clone());
+        }
+        let username = user_username(user);
+        let mut changed = false;
+        match user.get("is_contact").and_then(Value::as_bool) {
+            Some(true) if !self.contact_ids.contains(&id) => {
+                self.contact_ids.push(id);
+                changed = true;
+            }
+            Some(false) if self.contact_ids.contains(&id) => {
+                self.contact_ids.retain(|known| *known != id);
+                self.contact_meta.remove(&id);
+                changed = true;
+            }
+            Some(_) | None => {}
+        }
+        if !self.contact_ids.contains(&id) {
+            return changed;
+        }
+        let display = if !name.is_empty() {
+            name
+        } else if !username.is_empty() {
+            username.clone()
+        } else {
+            format!("User {id}")
+        };
+        let photo_null = user.get("profile_photo").is_some_and(Value::is_null);
+        let before = self
+            .contact_meta
+            .get(&id)
+            .and_then(|meta| meta.avatar.clone());
+        {
+            let entry = self.contact_meta.entry(id).or_insert_with(|| ContactMeta {
+                name: String::new(),
+                username: String::new(),
+                avatar: None,
+            });
+            if entry.name != display || entry.username != username {
+                entry.name = display;
+                entry.username = username;
+                changed = true;
+            }
+            if photo_null && entry.avatar.take().is_some() {
+                changed = true;
+            }
+        }
+        if photo_null {
+            return changed;
+        }
+        if let Some(file) = user.pointer("/profile_photo/small").cloned() {
+            self.watch_file(&file, FileRole::ContactAvatar(id));
+        }
+        let after = self
+            .contact_meta
+            .get(&id)
+            .and_then(|meta| meta.avatar.clone());
+        changed || before != after
     }
 
     fn on_messages(&mut self, event: &Value) -> Effect {
@@ -1175,6 +1402,16 @@ impl Shell {
                 chat.avatar = Some(path.to_string());
                 true
             }
+            Some(FileRole::ContactAvatar(user_id)) => {
+                let Some(meta) = self.contact_meta.get_mut(&user_id) else {
+                    return false;
+                };
+                if meta.avatar.as_deref() == Some(path) {
+                    return false;
+                }
+                meta.avatar = Some(path.to_string());
+                true
+            }
             Some(FileRole::MessagePhoto {
                 chat_id,
                 message_id,
@@ -1204,6 +1441,151 @@ impl Shell {
             }
             None => false,
         }
+    }
+
+    fn search(&mut self, query: String) -> Effect {
+        let query = query.trim().to_string();
+        self.search_gen = self.search_gen.wrapping_add(1);
+        self.search_query = query.clone();
+        self.search_ids.clear();
+        self.search_pending = 0;
+        self.search_error = false;
+        if query.is_empty() {
+            let mut ui = vec![self.search_update()];
+            if self.ready && !self.failed {
+                ui.push(UiUpdate::Status("Ready".into()));
+            }
+            return Effect::ui(ui);
+        }
+        if !self.ready || self.failed {
+            return Effect::ui(vec![
+                self.search_update(),
+                UiUpdate::Status("Search is available after TDLib is ready.".into()),
+            ]);
+        }
+        let gen = self.search_gen;
+        let limit = self.cfg.chat_limit.clamp(1, 50);
+        let mut send = vec![
+            search_chats_request(&query, limit, gen),
+            search_chats_on_server_request(&query, limit, gen),
+        ];
+        self.search_pending = 2;
+        if let Some(public_query) = public_search_query(&query) {
+            send.push(search_public_chats_request(&public_query, gen));
+            self.search_pending = 3;
+        }
+        Effect {
+            send,
+            ui: vec![self.search_update(), UiUpdate::Status("Searching…".into())],
+        }
+    }
+
+    fn on_search_chats(&mut self, gen: u64, event: &Value) -> Effect {
+        if gen != self.search_gen || self.search_query.is_empty() {
+            return Effect::none();
+        }
+        let mut missing = Vec::new();
+        if let Some(arr) = event["chat_ids"].as_array() {
+            for id in arr {
+                let Some(id) = json_i64(id) else {
+                    continue;
+                };
+                if self.search_ids.contains(&id) {
+                    continue;
+                }
+                self.search_ids.push(id);
+                let needs_title = self
+                    .chats
+                    .get(&id)
+                    .is_none_or(|chat| chat.title.is_empty() || chat.title == "…");
+                if needs_title {
+                    missing.push(id);
+                }
+            }
+        }
+        let mut effect = Effect::send(missing.into_iter().map(get_chat_search_request).collect());
+        effect.ui.push(self.search_update());
+        if self.note_search_done(gen) {
+            effect
+                .ui
+                .push(UiUpdate::Status(search_status(self.search_chats().len())));
+        }
+        effect
+    }
+
+    /// `true` when this generation's search requests have all returned and none failed.
+    fn note_search_done(&mut self, gen: u64) -> bool {
+        if gen != self.search_gen {
+            return false;
+        }
+        self.search_pending = self.search_pending.saturating_sub(1);
+        self.search_pending == 0 && !self.search_error
+    }
+
+    fn search_chats(&self) -> Vec<ChatItem> {
+        self.search_ids
+            .iter()
+            .filter_map(|id| {
+                let chat = self.chats.get(id)?;
+                if chat.title.is_empty() || chat.title == "…" {
+                    return None;
+                }
+                Some(chat.clone())
+            })
+            .collect()
+    }
+
+    fn search_update(&self) -> UiUpdate {
+        UiUpdate::SearchResults {
+            query: self.search_query.clone(),
+            chats: self.search_chats(),
+        }
+    }
+
+    fn load_contacts(&mut self) -> Effect {
+        if !self.ready || self.failed {
+            return Effect::ui(vec![UiUpdate::Status(
+                "Contacts are available after TDLib is ready.".into(),
+            )]);
+        }
+        Effect::send(vec![get_contacts_request()])
+    }
+
+    fn open_contact(&mut self, user_id: i64) -> Effect {
+        if !self.ready || self.failed || user_id == 0 {
+            return Effect::ui(vec![UiUpdate::Status(
+                "Contacts are available after TDLib is ready.".into(),
+            )]);
+        }
+        Effect {
+            send: vec![create_private_chat_request(user_id)],
+            ui: vec![UiUpdate::Status("Opening chat…".into())],
+        }
+    }
+
+    fn contacts_update(&self) -> UiUpdate {
+        let contacts = self
+            .contact_ids
+            .iter()
+            .map(|id| {
+                if let Some(meta) = self.contact_meta.get(id) {
+                    ContactItem {
+                        user_id: *id,
+                        name: meta.name.clone(),
+                        username: meta.username.clone(),
+                        avatar: meta.avatar.clone(),
+                    }
+                } else {
+                    ContactItem {
+                        user_id: *id,
+                        name: format!("User {id}"),
+                        username: String::new(),
+                        avatar: None,
+                    }
+                }
+            })
+            .collect();
+        UiUpdate::Contacts(contacts)
     }
 
     fn request_chats(&mut self) -> Effect {
@@ -1380,6 +1762,68 @@ fn status_for(state: &str) -> String {
         "authorizationStateClosed" => "Closed".into(),
         other => other.trim_start_matches("authorizationState").to_string(),
     }
+}
+
+fn user_username(user: &Value) -> String {
+    if let Some(name) = user["usernames"]["active_usernames"]
+        .as_array()
+        .and_then(|names| names.iter().find_map(Value::as_str))
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        return name.trim_start_matches('@').to_string();
+    }
+    if let Some(name) = user["usernames"]["editable_username"]
+        .as_str()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        return name.trim_start_matches('@').to_string();
+    }
+    user["username"]
+        .as_str()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(|name| name.trim_start_matches('@').to_string())
+        .unwrap_or_default()
+}
+
+/// `@name` and a single username-shaped token. Titles with spaces stay local
+/// plus `searchChats` / `searchChatsOnServer`.
+fn public_search_query(query: &str) -> Option<String> {
+    let trimmed = query.trim();
+    let (body, explicit) = if let Some(rest) = trimmed.strip_prefix('@') {
+        (rest, true)
+    } else {
+        (trimmed, false)
+    };
+    if body.is_empty()
+        || !body
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return None;
+    }
+    if explicit || body.chars().count() >= 5 {
+        Some(body.to_string())
+    } else {
+        None
+    }
+}
+
+fn search_status(count: usize) -> String {
+    match count {
+        1 => "Search: 1 chat".into(),
+        n => format!("Search: {n} chats"),
+    }
+}
+
+fn search_generation(extra: &str) -> Option<u64> {
+    let rest = extra
+        .strip_prefix("searchChatsOnServer:")
+        .or_else(|| extra.strip_prefix("searchPublicChats:"))
+        .or_else(|| extra.strip_prefix("searchChats:"))?;
+    rest.parse().ok()
 }
 
 fn user_name(user: &Value) -> String {
@@ -1832,6 +2276,56 @@ fn folder_title(info: &Value) -> String {
 
 fn json_i32(value: &Value) -> Option<i32> {
     i32::try_from(json_i64(value)?).ok()
+}
+
+fn search_chats_request(query: &str, limit: i32, gen: u64) -> Value {
+    json!({
+        "@type": "searchChats",
+        "query": query,
+        "type_filter": null,
+        "limit": limit,
+        "@extra": format!("searchChats:{gen}")
+    })
+}
+
+fn search_chats_on_server_request(query: &str, limit: i32, gen: u64) -> Value {
+    json!({
+        "@type": "searchChatsOnServer",
+        "query": query,
+        "type_filter": null,
+        "limit": limit,
+        "@extra": format!("searchChatsOnServer:{gen}")
+    })
+}
+
+fn search_public_chats_request(query: &str, gen: u64) -> Value {
+    json!({
+        "@type": "searchPublicChats",
+        "query": query,
+        "type_filter": null,
+        "@extra": format!("searchPublicChats:{gen}")
+    })
+}
+
+fn get_contacts_request() -> Value {
+    json!({"@type": "getContacts", "@extra": "getContacts"})
+}
+
+fn create_private_chat_request(user_id: i64) -> Value {
+    json!({
+        "@type": "createPrivateChat",
+        "user_id": user_id,
+        "force": false,
+        "@extra": format!("createPrivateChat:{user_id}")
+    })
+}
+
+fn get_chat_search_request(chat_id: i64) -> Value {
+    json!({
+        "@type": "getChat",
+        "chat_id": chat_id,
+        "@extra": format!("getChat:search:{chat_id}")
+    })
 }
 
 fn get_chat_request(chat_id: i64) -> Value {
@@ -3158,5 +3652,369 @@ mod tests {
             &body[messages[0].links[1].start..messages[0].links[1].end],
             "docs"
         );
+    }
+
+    fn search_requests(effect: &Effect) -> Vec<&str> {
+        effect
+            .send
+            .iter()
+            .filter_map(|request| request["@type"].as_str())
+            .collect()
+    }
+
+    #[test]
+    fn search_uses_1_8_67_filters_and_merges_unique_chats() {
+        let mut shell = Shell::new(cfg());
+        ready(&mut shell);
+        drive(
+            &mut shell,
+            json!({
+                "@type": "updateNewChat",
+                "chat": {"id": 1, "title": "Alpha"}
+            }),
+        );
+
+        let spaced = shell.on_command(ShellCommand::Search("hello world".into()));
+        assert_eq!(
+            search_requests(&spaced),
+            ["searchChats", "searchChatsOnServer"]
+        );
+        assert!(spaced
+            .send
+            .iter()
+            .all(|request| request["type_filter"].is_null()));
+        assert_eq!(spaced.send[0]["query"], "hello world");
+        assert!(spaced
+            .ui
+            .iter()
+            .any(|update| matches!(update, UiUpdate::Status(text) if text == "Searching…")));
+
+        let at = shell.on_command(ShellCommand::Search("@Telegram".into()));
+        assert_eq!(
+            search_requests(&at),
+            ["searchChats", "searchChatsOnServer", "searchPublicChats"]
+        );
+        assert_eq!(at.send[2]["query"], "Telegram");
+        assert!(at.send[2]["type_filter"].is_null());
+        let gen = at.send[0]["@extra"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("searchChats:")
+            .unwrap();
+
+        let local = drive(
+            &mut shell,
+            json!({
+                "@type": "chats",
+                "chat_ids": [1, 9],
+                "@extra": format!("searchChats:{gen}")
+            }),
+        );
+        assert_eq!(local.send[0]["@type"], "getChat");
+        assert_eq!(local.send[0]["@extra"], "getChat:search:9");
+        assert!(local
+            .ui
+            .iter()
+            .any(|update| matches!(update, UiUpdate::SearchResults { chats, .. } if chats.iter().any(|chat| chat.id == 1))));
+
+        let server = drive(
+            &mut shell,
+            json!({
+                "@type": "chats",
+                "chat_ids": [1, 9],
+                "@extra": format!("searchChatsOnServer:{gen}")
+            }),
+        );
+        assert!(server.send.is_empty());
+
+        drive(
+            &mut shell,
+            json!({
+                "@type": "chat",
+                "id": 9,
+                "title": "Public",
+                "@extra": "getChat:search:9"
+            }),
+        );
+        let public = drive(
+            &mut shell,
+            json!({
+                "@type": "chats",
+                "chat_ids": [9, 11],
+                "@extra": format!("searchPublicChats:{gen}")
+            }),
+        );
+        let UiUpdate::SearchResults { query, chats } = public
+            .ui
+            .iter()
+            .find(|update| matches!(update, UiUpdate::SearchResults { .. }))
+            .unwrap()
+        else {
+            panic!("missing search results");
+        };
+        assert_eq!(query, "@Telegram");
+        assert_eq!(
+            chats.iter().map(|chat| chat.id).collect::<Vec<_>>(),
+            vec![1, 9]
+        );
+        assert!(public.ui.iter().any(|update| {
+            matches!(update, UiUpdate::Status(text) if text == "Search: 2 chats")
+        }));
+
+        let stale = drive(
+            &mut shell,
+            json!({
+                "@type": "chats",
+                "chat_ids": [42],
+                "@extra": "searchChats:0"
+            }),
+        );
+        assert!(stale.ui.is_empty());
+        assert!(stale.send.is_empty());
+
+        let cleared = shell.on_command(ShellCommand::Search("  ".into()));
+        assert!(cleared.send.is_empty());
+        assert!(cleared.ui.iter().any(|update| {
+            matches!(update, UiUpdate::SearchResults { query, chats } if query.is_empty() && chats.is_empty())
+        }));
+        assert!(cleared
+            .ui
+            .iter()
+            .any(|update| matches!(update, UiUpdate::Status(text) if text == "Ready")));
+    }
+
+    #[test]
+    fn search_hit_without_a_list_position_stays_out_of_all_chats() {
+        let mut shell = Shell::new(cfg());
+        ready(&mut shell);
+        drive(
+            &mut shell,
+            json!({"@type": "chats", "chat_ids": [1], "@extra": "getChats"}),
+        );
+        drive(
+            &mut shell,
+            json!({"@type": "chat", "id": 1, "title": "Alpha", "@extra": "getChat:1"}),
+        );
+        let effect = shell.on_command(ShellCommand::Search("public".into()));
+        let gen = effect.send[0]["@extra"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("searchChats:")
+            .unwrap()
+            .to_string();
+        drive(
+            &mut shell,
+            json!({
+                "@type": "chats",
+                "chat_ids": [77],
+                "@extra": format!("searchChats:{gen}")
+            }),
+        );
+        let effect = drive(
+            &mut shell,
+            json!({
+                "@type": "chat",
+                "id": 77,
+                "title": "Elsewhere",
+                "@extra": "getChat:search:77"
+            }),
+        );
+        let UiUpdate::ChatList(items) = effect
+            .ui
+            .iter()
+            .find(|update| matches!(update, UiUpdate::ChatList(_)))
+            .unwrap()
+        else {
+            panic!("missing list");
+        };
+        assert!(items.iter().all(|chat| chat.id != 77));
+        assert!(items.iter().any(|chat| chat.id == 1));
+        let UiUpdate::SearchResults { chats, .. } = effect
+            .ui
+            .iter()
+            .find(|update| matches!(update, UiUpdate::SearchResults { .. }))
+            .unwrap()
+        else {
+            panic!("missing search");
+        };
+        assert_eq!(chats[0].title, "Elsewhere");
+    }
+
+    #[test]
+    fn search_error_is_status_and_not_fatal() {
+        let mut shell = Shell::new(cfg());
+        ready(&mut shell);
+        let effect = shell.on_command(ShellCommand::Search("ada".into()));
+        let gen = effect.send[0]["@extra"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("searchChats:")
+            .unwrap()
+            .to_string();
+        let effect = drive(
+            &mut shell,
+            json!({
+                "@type": "error",
+                "code": 400,
+                "message": "QUERY_TOO_SHORT",
+                "@extra": format!("searchChatsOnServer:{gen}")
+            }),
+        );
+        assert!(!shell.failed);
+        assert!(effect.ui.iter().any(|update| {
+            matches!(update, UiUpdate::Status(text) if text.contains("400") && text.contains("QUERY_TOO_SHORT"))
+        }));
+        assert!(!effect
+            .ui
+            .iter()
+            .any(|update| matches!(update, UiUpdate::Fatal(_))));
+    }
+
+    #[test]
+    fn contacts_follow_get_contacts_and_update_user() {
+        let mut shell = Shell::new(cfg());
+        ready(&mut shell);
+        let effect = shell.on_command(ShellCommand::LoadContacts);
+        assert_eq!(effect.send[0]["@type"], "getContacts");
+        assert_eq!(effect.send[0]["@extra"], "getContacts");
+
+        let effect = drive(
+            &mut shell,
+            json!({
+                "@type": "updateUser",
+                "user": {
+                    "@type": "user",
+                    "id": 4,
+                    "first_name": "Ada",
+                    "last_name": "Lovelace",
+                    "is_contact": true,
+                    "usernames": {
+                        "@type": "usernames",
+                        "active_usernames": ["ada"],
+                        "disabled_usernames": [],
+                        "editable_username": "ada"
+                    },
+                    "profile_photo": {
+                        "@type": "profilePhoto",
+                        "small": {
+                            "@type": "file",
+                            "id": 21,
+                            "local": {
+                                "path": "",
+                                "is_downloading_completed": false,
+                                "can_be_downloaded": true
+                            }
+                        }
+                    }
+                }
+            }),
+        );
+        assert_eq!(effect.send[0]["@type"], "downloadFile");
+        assert_eq!(effect.send[0]["file_id"], 21);
+
+        let effect = drive(
+            &mut shell,
+            json!({
+                "@type": "users",
+                "total_count": 1,
+                "user_ids": [4],
+                "@extra": "getContacts"
+            }),
+        );
+        assert!(effect.send.is_empty());
+        let UiUpdate::Contacts(contacts) = effect
+            .ui
+            .iter()
+            .find(|update| matches!(update, UiUpdate::Contacts(_)))
+            .unwrap()
+        else {
+            panic!("missing contacts");
+        };
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].name, "Ada Lovelace");
+        assert_eq!(contacts[0].username, "ada");
+
+        let effect = drive(
+            &mut shell,
+            json!({
+                "@type": "updateUser",
+                "user": {
+                    "id": 4,
+                    "first_name": "Ada",
+                    "last_name": "Lovelace",
+                    "is_contact": false,
+                    "usernames": {"active_usernames": ["ada"]}
+                }
+            }),
+        );
+        let UiUpdate::Contacts(contacts) = effect
+            .ui
+            .iter()
+            .find(|update| matches!(update, UiUpdate::Contacts(_)))
+            .unwrap()
+        else {
+            panic!("missing contacts");
+        };
+        assert!(contacts.is_empty());
+
+        let effect = drive(
+            &mut shell,
+            json!({
+                "@type": "error",
+                "code": 401,
+                "message": "Unauthorized",
+                "@extra": "getContacts"
+            }),
+        );
+        assert!(!shell.failed);
+        assert!(effect.ui.iter().any(|update| {
+            matches!(update, UiUpdate::Status(text) if text.contains("Contacts error 401"))
+        }));
+    }
+
+    #[test]
+    fn open_contact_creates_a_private_chat_then_selects_it() {
+        let mut shell = Shell::new(cfg());
+        ready(&mut shell);
+        let effect = shell.on_command(ShellCommand::OpenContact(4));
+        assert_eq!(effect.send[0]["@type"], "createPrivateChat");
+        assert_eq!(effect.send[0]["user_id"], 4);
+        assert_eq!(effect.send[0]["force"], false);
+        assert_eq!(effect.send[0]["@extra"], "createPrivateChat:4");
+
+        let effect = drive(
+            &mut shell,
+            json!({
+                "@type": "chat",
+                "id": 80,
+                "title": "Ada Lovelace",
+                "@extra": "createPrivateChat:4"
+            }),
+        );
+        assert!(effect
+            .send
+            .iter()
+            .any(|request| request["@type"] == "openChat" && request["chat_id"] == 80));
+        assert!(effect
+            .ui
+            .iter()
+            .any(|update| matches!(update, UiUpdate::OpenChat(80))));
+        assert!(effect.ui.iter().any(|update| {
+            matches!(update, UiUpdate::Conversation { chat_id: 80, title, .. } if title == "Ada Lovelace")
+        }));
+
+        let effect = drive(
+            &mut shell,
+            json!({
+                "@type": "error",
+                "code": 400,
+                "message": "User not found",
+                "@extra": "createPrivateChat:4"
+            }),
+        );
+        assert!(!shell.failed);
+        assert!(effect.ui.iter().any(|update| {
+            matches!(update, UiUpdate::Status(text) if text.contains("User not found"))
+        }));
     }
 }
