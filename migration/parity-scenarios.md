@@ -277,12 +277,67 @@ for pixel.
   (S13). Choosing All chats, a local group, or Subscriptions leaves the
   profile and shows that view’s conversation again.
 
+### S15 — Settings shell
+
+- **id:** S15
+- **area:** settings-notifications (M13)
+- **steps:** Click Settings in the groups column. Read the section list.
+  Click Appearance, then Account, Privacy, Data & storage, and About. Press
+  Back.
+- **expected (Flutter / TDLib):** Settings replaces the conversation pane.
+  No fifth column appears. Back returns to the transcript, or to the
+  Subscriptions item when that view is open. The sections are Notifications,
+  Appearance, Account, Privacy, Data & storage, and About. Notifications is
+  the live section (S16). Each other section shows “Coming soon”. A click
+  does not close the session.
+- **how to check on gpui:** Settings is the `cog-6-tooth` control at the
+  bottom of the groups column. Back is `chevron-left`. The pane title is
+  Settings. The status line is under that title. Choosing a stub section
+  replaces the detail with Coming soon and leaves the chat list in place.
+
+### S16 — Notification mute
+
+- **id:** S16
+- **area:** settings-notifications (M13)
+- **steps:** After TDLib is ready, open Settings → Notifications. Read
+  Private chats, Groups, and Channels. Mute one scope, then unmute it.
+  Toggle previews. Open a chat. Mute it from the header. Open Settings
+  again and unmute that same chat from This chat. Mute a chat whose
+  settings still use the scope default, and confirm the header follows
+  the scope until the chat is muted on its own.
+- **expected (Flutter / TDLib):** Ready sends `getScopeNotificationSettings`
+  for `notificationSettingsScopePrivateChats`,
+  `notificationSettingsScopeGroupChats`, and
+  `notificationSettingsScopeChannelChats`. Opening Settings sends those
+  three again. Mute and preview call `setScopeNotificationSettings` with
+  the full `scopeNotificationSettings` object, keeping fields that were
+  not toggled (including `sound_id`). Per-chat mute and unmute call
+  `setChatNotificationSettings` with the full `chatNotificationSettings`
+  object. Mute sets `use_default_mute_for` false and `mute_for` longer
+  than 366 days, which TDLib 1.8.67 treats as forever. Unmute sets
+  `mute_for` to 0 and `use_default_mute_for` false, so a muted scope does
+  not turn the chat back on. A chat that still has `use_default_mute_for`
+  shows the scope’s mute. `updateChatNotificationSettings` and
+  `updateScopeNotificationSettings` refresh the same state. Nothing is
+  written to a local notification file. Desktop tray alerts are not sent.
+  A failure stays on the status line as
+  `Notification error <code>: <message>` and does not close the session.
+  There is no `logOut` and no `getChatFolders`.
+- **how to check on gpui:** The header control is `bell` when the open
+  chat is unmuted and `bell-slash` when it is muted, labeled Mute or
+  Unmute. A muted row in the chat list shows `bell-slash`. Notifications
+  lists Private chats, Groups, and Channels with Muted or Unmuted,
+  Previews on or off, and the same Mute / Unmute and Show previews /
+  Hide previews controls. This chat names the open chat, or says to open
+  one. A line says desktop alerts are not sent and mute is saved in TDLib.
+  Before Ready, the controls do not send and the status line says
+  notifications are available after TDLib is ready.
+
 ## Upcoming
 
 These are not judge scenarios yet. They are named so a later pass does not
 treat them as already live.
 
-- **Settings shell and notifications (M13, `next`), then richer messaging
-  (M14, `next`).** No settings or notification surface is in the live window.
-  Profile is already S14. Scenarios for settings and notifications wait until
-  those modules are kicked.
+- **Richer messaging (M14, `next`).** Stickers, voice, reply, and forward
+  are not in the live window. Settings and notifications are already S15
+  and S16. Scenarios for richer messaging wait until that module is kicked.

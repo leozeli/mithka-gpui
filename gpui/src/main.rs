@@ -10,7 +10,8 @@
 //! http(s) entities, and `Input` plus a primary `Button` for the composer.
 //! All chats and Contacts hide the middle column. A local group shows only
 //! that group's nested Telegram folders there. Subscriptions uses it for feed
-//! sources. A profile replaces the conversation pane until Back. Subscriptions are local RSS/Atom items, not TDLib chats. The transcript itself is
+//! sources. A profile or Settings replaces the conversation pane until Back.
+//! Subscriptions are local RSS/Atom items, not TDLib chats. The transcript itself is
 //! GPUI's virtual list — the same list `MessageScroller` wraps — so a scroll
 //! to the first row can ask TDLib for an older page. `MessageScroller` does
 //! not expose that offset. Charts, docks, sidebars, tables, and forms from
@@ -34,8 +35,8 @@ use gpui_kit::{
 use mithka_rss::{store_path as subscriptions_path, FeedClient, FeedEvent, SubscriptionStore};
 use mithka_tdlib::{
     inspect_database, is_http_url, list_time, message_time, ChatItem, ContactItem, FolderItem,
-    LiveClient, MessageKind, Profile, ProfileKind, SessionConfig, ShellCommand, TdJson, TextLink,
-    TextMessage, UiUpdate,
+    LiveClient, MessageKind, NotificationScope, Profile, ProfileKind, ScopeNotification,
+    SessionConfig, ShellCommand, TdJson, TextLink, TextMessage, UiUpdate,
 };
 use std::collections::HashSet;
 use std::io::Read;
@@ -314,6 +315,11 @@ struct ShellView {
     /// Profile replaces the conversation pane. The open chat stays selected.
     show_profile: bool,
     profile: Option<Profile>,
+    /// Settings replaces the conversation pane, same as profile. No fifth column.
+    show_settings: bool,
+    settings_section: SettingsSection,
+    /// TDLib scope defaults. Empty until `getScopeNotificationSettings` answers.
+    scopes: Vec<ScopeNotification>,
     pins: PinLibrary,
     /// Subscriptions replaces the folder, chat, and conversation columns.
     show_feeds: bool,
@@ -399,6 +405,9 @@ impl ShellView {
             contacts: Vec::new(),
             show_profile: false,
             profile: None,
+            show_settings: false,
+            settings_section: SettingsSection::Notifications,
+            scopes: Vec::new(),
             show_feeds: false,
             feeds: SubscriptionStore::load(feeds_path),
             feed_source: None,
@@ -524,6 +533,7 @@ impl ShellView {
                     self.profile = Some(profile);
                 }
             }
+            UiUpdate::NotificationScopes(scopes) => self.scopes = scopes,
             UiUpdate::OpenChat(chat_id) => {
                 self.open_chat = Some(chat_id);
                 self.convo_title = self
@@ -741,7 +751,85 @@ impl ShellView {
         }
     }
 
+    fn dismiss_settings(&mut self) {
+        self.show_settings = false;
+    }
+
+    fn open_settings(&mut self, cx: &mut gpui_kit::Context<Self>) {
+        self.dismiss_profile();
+        self.show_settings = true;
+        self.settings_section = SettingsSection::Notifications;
+        self.client.send(ShellCommand::LoadNotificationSettings);
+        cx.notify();
+    }
+
+    fn close_settings(&mut self, window: &mut Window, cx: &mut gpui_kit::Context<Self>) {
+        self.dismiss_settings();
+        if self.open_chat.is_some() && !self.show_feeds {
+            self.composer.read(cx).focus_handle(cx).focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn open_chat_muted(&self) -> bool {
+        let Some(chat_id) = self.open_chat else {
+            return false;
+        };
+        self.chats
+            .iter()
+            .chain(self.search_hits.iter())
+            .find(|chat| chat.id == chat_id)
+            .is_some_and(|chat| chat.muted)
+    }
+
+    fn toggle_open_chat_mute(&mut self, cx: &mut gpui_kit::Context<Self>) {
+        let Some(chat_id) = self.open_chat else {
+            return;
+        };
+        if !self.ready {
+            return;
+        }
+        self.client.send(ShellCommand::SetChatMuted {
+            chat_id,
+            muted: !self.open_chat_muted(),
+        });
+        cx.notify();
+    }
+
+    fn toggle_scope_mute(&mut self, scope: NotificationScope, cx: &mut gpui_kit::Context<Self>) {
+        if !self.ready {
+            return;
+        }
+        let muted = self
+            .scopes
+            .iter()
+            .find(|row| row.scope == scope)
+            .is_some_and(|row| row.muted);
+        self.client.send(ShellCommand::SetScopeMuted {
+            scope,
+            muted: !muted,
+        });
+        cx.notify();
+    }
+
+    fn toggle_scope_preview(&mut self, scope: NotificationScope, cx: &mut gpui_kit::Context<Self>) {
+        if !self.ready {
+            return;
+        }
+        let show_preview = self
+            .scopes
+            .iter()
+            .find(|row| row.scope == scope)
+            .is_none_or(|row| row.show_preview);
+        self.client.send(ShellCommand::SetScopeShowPreview {
+            scope,
+            show_preview: !show_preview,
+        });
+        cx.notify();
+    }
+
     fn show_chat_profile(&mut self, cx: &mut gpui_kit::Context<Self>) {
+        self.dismiss_settings();
         let Some(chat_id) = self.open_chat else {
             return;
         };
@@ -772,6 +860,7 @@ impl ShellView {
     }
 
     fn show_user_profile(&mut self, user_id: i64, cx: &mut gpui_kit::Context<Self>) {
+        self.dismiss_settings();
         if !self.ready {
             return;
         }
@@ -1287,7 +1376,9 @@ impl Render for ShellView {
         } else {
             self.chat_pane(cx, border, muted).into_any_element()
         };
-        let detail = if self.show_feeds {
+        let detail = if self.show_settings {
+            self.settings_pane(cx, border, muted).into_any_element()
+        } else if self.show_feeds {
             self.article_pane(cx, border, muted).into_any_element()
         } else if self.show_profile {
             self.profile_pane(cx, border, muted).into_any_element()
@@ -2160,6 +2251,17 @@ impl ShellView {
                             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                                 this.commit_group_draft(window, cx);
                             })),
+                    ))
+                    .child(with_icon(
+                        Icon::Cog6Tooth,
+                        glyph,
+                        Button::new("open-settings")
+                            .ghost()
+                            .small()
+                            .label("Settings")
+                            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                this.open_settings(cx);
+                            })),
                     )),
             )
     }
@@ -2393,6 +2495,7 @@ impl ShellView {
                                     .text_ellipsis()
                                     .child(title),
                             )
+                            .when(chat.muted, |row| row.child(hero(Icon::BellSlash, muted)))
                             .when(self.pins.is_pinned(chat_id), |row| {
                                 row.child(hero(Icon::MapPin, muted)).child(
                                     div()
@@ -2553,7 +2656,25 @@ impl ShellView {
                                     self.open_chat.is_some_and(|id| self.pins.is_pinned(id));
                                 let label = if pinned { "Unpin" } else { "Pin" };
                                 let row = if self.ready {
+                                    let chat_muted = self.open_chat_muted();
                                     row.child(with_icon(
+                                        if chat_muted {
+                                            Icon::BellSlash
+                                        } else {
+                                            Icon::Bell
+                                        },
+                                        muted,
+                                        Button::new("toggle-chat-mute")
+                                            .ghost()
+                                            .small()
+                                            .label(mute_control_label(chat_muted))
+                                            .on_click(cx.listener(
+                                                |this, _: &ClickEvent, _window, cx| {
+                                                    this.toggle_open_chat_mute(cx);
+                                                },
+                                            )),
+                                    ))
+                                    .child(with_icon(
                                         Icon::UserCircle,
                                         muted,
                                         Button::new("open-profile")
@@ -2740,6 +2861,238 @@ impl ShellView {
                 )
             })
     }
+
+    fn settings_pane(
+        &self,
+        cx: &mut gpui_kit::Context<Self>,
+        border: gpui_kit::Hsla,
+        muted: gpui_kit::Hsla,
+    ) -> impl IntoElement {
+        let fill = cx.theme().secondary;
+        let glyph = cx.theme().foreground;
+        let sections = settings_sections().map(|(label, section)| {
+            self.side_row(
+                settings_section_id(section),
+                label,
+                if section == SettingsSection::Notifications {
+                    Icon::Bell
+                } else {
+                    Icon::Cog6Tooth
+                },
+                self.settings_section == section,
+                fill,
+                glyph,
+                cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                    this.settings_section = section;
+                    cx.notify();
+                }),
+            )
+        });
+        let detail = if let Some(stub) = settings_stub(self.settings_section) {
+            div().text_color(muted).child(stub).into_any_element()
+        } else {
+            self.notifications_detail(cx, muted).into_any_element()
+        };
+
+        v_flex()
+            .flex_1()
+            .h_full()
+            .min_w_0()
+            .child(
+                h_flex()
+                    .w_full()
+                    .px_4()
+                    .py_3()
+                    .gap_2()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(border)
+                    .child(with_icon(
+                        Icon::ChevronLeft,
+                        muted,
+                        Button::new("settings-back")
+                            .ghost()
+                            .small()
+                            .label("Back")
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.close_settings(window, cx);
+                            })),
+                    ))
+                    .child(div().text_size(px(16.)).child("Settings")),
+            )
+            .child(
+                div()
+                    .px_4()
+                    .pb_2()
+                    .text_size(px(12.))
+                    .text_color(muted)
+                    .child(self.status.clone()),
+            )
+            .child(
+                div()
+                    .id("settings-body")
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .overflow_y_scrollbar()
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .border_b_1()
+                            .border_color(border)
+                            .children(sections),
+                    )
+                    .child(div().w_full().p_4().child(detail)),
+            )
+    }
+
+    fn notifications_detail(
+        &self,
+        cx: &mut gpui_kit::Context<Self>,
+        muted: gpui_kit::Hsla,
+    ) -> impl IntoElement {
+        let scopes = NotificationScope::all().map(|scope| self.scope_setting_row(scope, cx, muted));
+        let chat_title = if self.open_chat.is_some() {
+            self.convo_title.clone()
+        } else {
+            String::new()
+        };
+        let chat_muted = self.open_chat_muted();
+        v_flex()
+            .w_full()
+            .gap_3()
+            .child(div().text_size(px(12.)).text_color(muted).child("Defaults"))
+            .children(scopes)
+            .child(
+                div()
+                    .pt_2()
+                    .text_size(px(12.))
+                    .text_color(muted)
+                    .child("This chat"),
+            )
+            .child(if self.open_chat.is_some() {
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(chat_title),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(muted)
+                            .child(if chat_muted { "Muted" } else { "Unmuted" }),
+                    )
+                    .child(with_icon(
+                        if chat_muted {
+                            Icon::BellSlash
+                        } else {
+                            Icon::Bell
+                        },
+                        muted,
+                        Button::new("settings-chat-mute")
+                            .ghost()
+                            .small()
+                            .disabled(!self.ready)
+                            .label(mute_control_label(chat_muted))
+                            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                this.toggle_open_chat_mute(cx);
+                            })),
+                    ))
+                    .into_any_element()
+            } else {
+                div()
+                    .text_color(muted)
+                    .child("Open a chat to mute it. The chat header has the same Mute button.")
+                    .into_any_element()
+            })
+            .child(
+                div()
+                    .pt_2()
+                    .text_size(px(12.))
+                    .text_color(muted)
+                    .child("Desktop alerts are not sent from this window. Mute is saved in TDLib."),
+            )
+    }
+
+    fn scope_setting_row(
+        &self,
+        scope: NotificationScope,
+        cx: &mut gpui_kit::Context<Self>,
+        muted: gpui_kit::Hsla,
+    ) -> gpui_kit::AnyElement {
+        let known = self.scopes.iter().find(|row| row.scope == scope);
+        let Some(known) = known else {
+            return h_flex()
+                .w_full()
+                .items_center()
+                .gap_2()
+                .min_h(px(36.))
+                .child(div().flex_1().child(scope_label(scope)))
+                .child(div().text_size(px(12.)).text_color(muted).child("Loading…"))
+                .into_any_element();
+        };
+        let is_muted = known.muted;
+        let show_preview = known.show_preview;
+        let mute_id = format!("scope-mute-{}", scope.key());
+        let preview_id = format!("scope-preview-{}", scope.key());
+        h_flex()
+            .w_full()
+            .items_center()
+            .gap_2()
+            .min_h(px(36.))
+            .child(div().w(px(120.)).flex_shrink_0().child(scope_label(scope)))
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(muted)
+                    .child(if is_muted { "Muted" } else { "Unmuted" }),
+            )
+            .child(with_icon(
+                if is_muted {
+                    Icon::BellSlash
+                } else {
+                    Icon::Bell
+                },
+                muted,
+                Button::new(gpui_kit::SharedString::from(mute_id))
+                    .ghost()
+                    .small()
+                    .disabled(!self.ready)
+                    .label(mute_control_label(is_muted))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                        this.toggle_scope_mute(scope, cx);
+                    })),
+            ))
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(muted)
+                    .child(if show_preview {
+                        "Previews on"
+                    } else {
+                        "Previews off"
+                    }),
+            )
+            .child(
+                Button::new(gpui_kit::SharedString::from(preview_id))
+                    .ghost()
+                    .small()
+                    .disabled(!self.ready)
+                    .label(preview_control_label(show_preview))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                        this.toggle_scope_preview(scope, cx);
+                    })),
+            )
+            .into_any_element()
+    }
 }
 
 fn article_paragraphs(body: &str) -> Vec<String> {
@@ -2800,6 +3153,74 @@ enum ProfileAction {
     Message,
     /// Open the private chat, creating it when this profile came from Contacts.
     OpenChat,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingsSection {
+    Notifications,
+    Appearance,
+    Account,
+    Privacy,
+    DataStorage,
+    About,
+}
+
+fn settings_sections() -> [(&'static str, SettingsSection); 6] {
+    [
+        ("Notifications", SettingsSection::Notifications),
+        ("Appearance", SettingsSection::Appearance),
+        ("Account", SettingsSection::Account),
+        ("Privacy", SettingsSection::Privacy),
+        ("Data & storage", SettingsSection::DataStorage),
+        ("About", SettingsSection::About),
+    ]
+}
+
+fn settings_section_id(section: SettingsSection) -> &'static str {
+    match section {
+        SettingsSection::Notifications => "settings-notifications",
+        SettingsSection::Appearance => "settings-appearance",
+        SettingsSection::Account => "settings-account",
+        SettingsSection::Privacy => "settings-privacy",
+        SettingsSection::DataStorage => "settings-data",
+        SettingsSection::About => "settings-about",
+    }
+}
+
+/// `None` is the live Notifications section. Every other section has copy.
+fn settings_stub(section: SettingsSection) -> Option<&'static str> {
+    match section {
+        SettingsSection::Notifications => None,
+        SettingsSection::Appearance
+        | SettingsSection::Account
+        | SettingsSection::Privacy
+        | SettingsSection::DataStorage
+        | SettingsSection::About => Some("Coming soon"),
+    }
+}
+
+fn mute_control_label(muted: bool) -> &'static str {
+    if muted {
+        "Unmute"
+    } else {
+        "Mute"
+    }
+}
+
+fn preview_control_label(show_preview: bool) -> &'static str {
+    if show_preview {
+        "Hide previews"
+    } else {
+        "Show previews"
+    }
+}
+
+fn scope_label(scope: NotificationScope) -> &'static str {
+    match scope {
+        NotificationScope::Private => "Private chats",
+        NotificationScope::Group => "Groups",
+        NotificationScope::Channel => "Channels",
+    }
 }
 
 fn profile_action(profile: &Profile, open_chat: Option<i64>) -> ProfileAction {
@@ -3324,6 +3745,33 @@ mod layout_tests {
             vec!["Line one", "Line two"]
         );
     }
+
+    #[test]
+    fn settings_stubs_say_coming_soon_and_mute_labels_flip() {
+        use super::{
+            mute_control_label, preview_control_label, scope_label, settings_section_id,
+            settings_sections, settings_stub, SettingsSection,
+        };
+        use mithka_tdlib::NotificationScope;
+
+        assert_eq!(settings_sections().len(), 6);
+        assert_eq!(settings_sections()[0].0, "Notifications");
+        assert!(settings_stub(SettingsSection::Notifications).is_none());
+        for (_, section) in settings_sections() {
+            if section == SettingsSection::Notifications {
+                continue;
+            }
+            assert_eq!(settings_stub(section), Some("Coming soon"));
+            assert!(!settings_section_id(section).is_empty());
+        }
+        assert_eq!(mute_control_label(false), "Mute");
+        assert_eq!(mute_control_label(true), "Unmute");
+        assert_eq!(preview_control_label(true), "Hide previews");
+        assert_eq!(preview_control_label(false), "Show previews");
+        assert_eq!(scope_label(NotificationScope::Private), "Private chats");
+        assert_eq!(scope_label(NotificationScope::Group), "Groups");
+        assert_eq!(scope_label(NotificationScope::Channel), "Channels");
+    }
 }
 
-// PORT STATUS: module=M12 confidence=high todos=0
+// PORT STATUS: module=M13 confidence=high todos=0

@@ -59,9 +59,12 @@ Checked against `gpui/assets/heroicons/outline/`. That directory is the only Her
 ### Already vendored (on this checklist)
 
 - `arrow-path`
+- `bell` — mute control in the open-chat header and in Settings (Heroicons v2.2.0 outline)
+- `bell-slash` — muted state, same places (Heroicons v2.2.0 outline)
 - `chat-bubble-left`
 - `check`
-- `chevron-left` — Back from the profile pane to the transcript (Heroicons v2.2.0 outline)
+- `chevron-left` — Back from the profile pane and from Settings (Heroicons v2.2.0 outline)
+- `cog-6-tooth` — Settings in the groups column footer (Heroicons v2.2.0 outline)
 - `folder`
 - `inbox`
 - `magnifying-glass` — search field above the chat list (Heroicons v2.2.0 outline)
@@ -87,8 +90,6 @@ P0:
 - `arrow-down`
 - `arrow-uturn-left`
 - `arrow-uturn-right`
-- `bell`
-- `bell-slash`
 - `chevron-right`
 - `ellipsis-horizontal`
 - `face-smile`
@@ -104,7 +105,6 @@ P1 (names not already listed under P0):
 - `book-open`
 - `briefcase`
 - `code-bracket`
-- `cog-6-tooth`
 - `cpu-chip`
 - `gift`
 - `globe-alt`

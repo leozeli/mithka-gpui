@@ -11,8 +11,8 @@ M09	heroicons-outline	done	Partial Heroicons outline set under gpui/assets/heroi
 M10	icons-md	done	icons.md is already on main. Link it from the rulebook. Do not rewrite it
 M11	contacts-search	done	Contacts list and global search MVP. Landed in 5e4f6bc
 M12	profile	done	Profile pane for a private user, secret chat, basic group, or channel/supergroup. Replaces the conversation. Back returns to the chat
-M13	settings-notifications	next	Settings shell and notifications
-M14	messaging-rich	next	Thicken messaging: stickers, voice, reply, forward
+M13	settings-notifications	done	Settings shell plus TDLib mute for the open chat and private/group/channel scopes. Desktop push is not sent
+M14	messaging-rich	next	Thicken messaging: stickers, voice, reply, forward. This is the next module to kick
 M15	stories	later	Stories
 M16	calls	later	Calls
 M17	mini-apps	later	Mini Apps

@@ -31,7 +31,7 @@ icon stack. Implementation stays Heroicons plus gpui-kit.
 | 0b. Judge | `prompts/00b-judge-setup.md` | `parity-scenarios.md`. Dart unit tests that import internals are not the judge. |
 | 1. Map and rules | `prompts/01-dependency-map.md`, `prompts/02-gap-inventory.md` | `RULEBOOK.md`, `manifest.tsv` (module queue), `inventory.tsv` (seed gaps; the survey appends rows). |
 | 2. Stress-test | `prompts/03-stress-test.md` | No bakeoff artifacts. Amendments land in `RULEBOOK.md` between modules. |
-| 3. Implement | `prompts/04-translation-kickoff.md` | The queue is `manifest.tsv`. Work `next`, then `later`. The next module is settings and notifications (M13). Profile (M12) is `done`. |
+| 3. Implement | `prompts/04-translation-kickoff.md` | The queue is `manifest.tsv`. Work `next`, then `later`. The next module is richer messaging (M14). Settings and notifications (M13) are `done`. Profile (M12) is `done`. |
 | 4. Survey build | `prompts/05-survey-build.md` | `cargo build -p mithka-gpui`. Record the run in `cost-log.tsv`. |
 | 5. Run | (kit has no separate prompt) | `mithka-gpui` on a copied TDLib database. |
 | 6. Match behavior | `prompts/06-post-parity.md` after the gate | `parity-scenarios.md` for `done` modules, then `BUG(port)` / `TODO(port)` / `PERF(port)` markers. |
@@ -52,4 +52,5 @@ memory:
   Use `unknown` when a figure was not measured.
 
 Contacts and global search (`M11`) are `done` (landed in `5e4f6bc`). Profile
-(`M12`) is `done`. The next module to kick is settings and notifications (`M13`).
+(`M12`) is `done`. Settings and notifications (`M13`) are `done`. The next
+module to kick is richer messaging (`M14`).

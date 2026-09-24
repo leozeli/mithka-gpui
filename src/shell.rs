@@ -2,13 +2,20 @@
 //!
 //! The CLI driver exits after printing titles. This one stays open: it keeps
 //! the main chat list, loads text and photo history, sends plain-text messages,
-//! and loads a profile for a user, basic group, or channel.
+//! loads a profile for a user, basic group, or channel, and reads or writes
+//! TDLib notification mute settings.
 //! The receive loop runs on a background thread so the UI can own the main thread.
 
 use crate::driver::{
     bootstrap_request, explain_error, parse_version, set_tdlib_parameters, set_verbosity_request,
     version_request, SessionConfig,
 };
+use crate::notify::{
+    chat_is_muted, parse_chat_notification_settings, parse_scope_notification_settings,
+    scope_fetch_requests, scope_from_extra, set_chat_notification_settings,
+    set_scope_notification_settings, ChatNotificationSettings, ScopeNotificationState,
+};
+pub use crate::notify::{NotificationScope, ScopeNotification};
 use crate::tdjson::TdJson;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -34,6 +41,9 @@ pub struct ChatItem {
     pub preview: String,
     /// Unix time of that last message. `0` when TDLib has none.
     pub preview_date: i64,
+    /// Effective mute. A chat with `use_default_mute_for` follows its scope.
+    /// `false` until TDLib has sent settings (unmuted is the TDLib default).
+    pub muted: bool,
     real_order: bool,
 }
 
@@ -47,6 +57,7 @@ fn empty_chat(id: i64) -> ChatItem {
         avatar: None,
         preview: String::new(),
         preview_date: 0,
+        muted: false,
         real_order: false,
     }
 }
@@ -241,6 +252,9 @@ pub enum UiUpdate {
     /// The profile pane. Later updates refresh the same peer until
     /// [`ShellCommand::CloseProfile`].
     Profile(Profile),
+    /// Scope defaults that TDLib has returned. A missing scope is still loading.
+    /// This is not a local notification database.
+    NotificationScopes(Vec<ScopeNotification>),
     Fatal(String),
 }
 
@@ -269,6 +283,25 @@ pub enum ShellCommand {
     OpenUserProfile(i64),
     /// The profile pane closed. Further updates are not pushed as [`UiUpdate::Profile`].
     CloseProfile,
+    /// `getScopeNotificationSettings` for private, group, and channel chats.
+    LoadNotificationSettings,
+    /// Mute or unmute one chat via `setChatNotificationSettings`.
+    /// Mute uses a duration longer than 366 days (forever on TDLib 1.8.67) and
+    /// turns off `use_default_mute_for`. Unmute sets `mute_for` to 0.
+    SetChatMuted {
+        chat_id: i64,
+        muted: bool,
+    },
+    /// Default mute for a scope, via `setScopeNotificationSettings`.
+    SetScopeMuted {
+        scope: NotificationScope,
+        muted: bool,
+    },
+    /// Default `show_preview` for a scope, via `setScopeNotificationSettings`.
+    SetScopeShowPreview {
+        scope: NotificationScope,
+        show_preview: bool,
+    },
     Close,
 }
 
@@ -343,6 +376,11 @@ pub struct Shell {
     profile_details_sent: bool,
     /// A profile request failed. Later successes must not clear that status line.
     profile_failed: bool,
+    chat_notifications: HashMap<i64, ChatNotificationSettings>,
+    scopes: HashMap<NotificationScope, ScopeNotificationState>,
+    /// `@extra` → settings sent, applied when that `ok` arrives.
+    pending_chat_notify: HashMap<String, (i64, ChatNotificationSettings)>,
+    pending_scope_notify: HashMap<String, (NotificationScope, ScopeNotificationState)>,
 }
 
 struct Effect {
@@ -395,6 +433,10 @@ impl Shell {
             profile_target: None,
             profile_details_sent: false,
             profile_failed: false,
+            chat_notifications: HashMap::new(),
+            scopes: HashMap::new(),
+            pending_chat_notify: HashMap::new(),
+            pending_scope_notify: HashMap::new(),
         }
     }
 
@@ -420,6 +462,13 @@ impl Shell {
             ShellCommand::OpenChatProfile(chat_id) => self.open_chat_profile(chat_id),
             ShellCommand::OpenUserProfile(user_id) => self.open_user_profile(user_id),
             ShellCommand::CloseProfile => self.close_profile(),
+            ShellCommand::LoadNotificationSettings => self.load_notification_settings(),
+            ShellCommand::SetChatMuted { chat_id, muted } => self.set_chat_muted(chat_id, muted),
+            ShellCommand::SetScopeMuted { scope, muted } => self.set_scope_muted(scope, muted),
+            ShellCommand::SetScopeShowPreview {
+                scope,
+                show_preview,
+            } => self.set_scope_show_preview(scope, show_preview),
         }
     }
 
@@ -467,6 +516,10 @@ impl Shell {
             "basicGroupFullInfo" | "updateBasicGroupFullInfo" => self.on_basic_group_full(event),
             "supergroup" | "updateSupergroup" => self.on_supergroup(event),
             "supergroupFullInfo" | "updateSupergroupFullInfo" => self.on_supergroup_full(event),
+            "updateChatNotificationSettings" => self.on_chat_notification_settings(event),
+            "scopeNotificationSettings" | "updateScopeNotificationSettings" => {
+                self.on_scope_notification_settings(event)
+            }
             "users" => self.on_users(event),
             "messages" => self.on_messages(event),
             "message" | "updateNewMessage" => self.on_message_event(event),
@@ -522,6 +575,7 @@ impl Shell {
                 let mut effect = self.request_chats();
                 effect.send.insert(0, get_me_request());
                 effect.send.insert(1, load_chats(self.cfg.chat_limit));
+                effect.send.extend(scope_fetch_requests());
                 effect.ui.splice(0..0, ui);
                 effect
             }
@@ -599,6 +653,17 @@ impl Shell {
                 UiUpdate::Status(format!("Could not open contact: {message}")),
             ]);
         }
+        if extra.starts_with("setChatNotificationSettings:")
+            || extra.starts_with("setScopeNotificationSettings:")
+            || extra.starts_with("getScopeNotificationSettings:")
+        {
+            self.pending_chat_notify.remove(extra);
+            self.pending_scope_notify.remove(extra);
+            return Effect::ui(vec![
+                UiUpdate::Log(rendered),
+                UiUpdate::Status(format!("Notification error {code}: {message}")),
+            ]);
+        }
         if self.is_profile_error(extra) {
             self.profile_failed = true;
             let mut effect = Effect::ui(vec![
@@ -639,7 +704,11 @@ impl Shell {
     }
 
     fn on_ok(&mut self, event: &Value) -> Effect {
-        match event["@extra"].as_str().unwrap_or("") {
+        let extra = event["@extra"].as_str().unwrap_or("").to_string();
+        if let Some(effect) = self.take_notification_ok(&extra) {
+            return effect;
+        }
+        match extra.as_str() {
             "setTdlibParameters" => {
                 Effect::ui(vec![UiUpdate::Log("setTdlibParameters accepted".into())])
             }
@@ -1398,6 +1467,12 @@ impl Shell {
             return false;
         };
         self.note_peer(chat);
+        if let Some(settings) = chat
+            .get("notification_settings")
+            .and_then(parse_chat_notification_settings)
+        {
+            self.chat_notifications.insert(id, settings);
+        }
         let outbox_changed = json_i64(&chat["last_read_outbox_message_id"])
             .is_some_and(|message_id| self.note_outbox(id, message_id));
         let title = chat["title"].as_str().unwrap_or("…").to_string();
@@ -1757,7 +1832,7 @@ impl Shell {
                 if chat.title.is_empty() || chat.title == "…" {
                     return None;
                 }
-                Some(chat.clone())
+                Some(self.with_mute(chat.clone()))
             })
             .collect()
     }
@@ -1815,6 +1890,145 @@ impl Shell {
         UiUpdate::Contacts(contacts)
     }
 
+    fn load_notification_settings(&mut self) -> Effect {
+        if !self.ready || self.failed {
+            return notification_unavailable();
+        }
+        Effect::send(scope_fetch_requests())
+    }
+
+    fn set_chat_muted(&mut self, chat_id: i64, muted: bool) -> Effect {
+        if !self.ready || self.failed || chat_id == 0 {
+            return notification_unavailable();
+        }
+        let settings = self
+            .chat_notifications
+            .get(&chat_id)
+            .cloned()
+            .unwrap_or_else(ChatNotificationSettings::mute_only)
+            .with_muted(muted);
+        let request = set_chat_notification_settings(chat_id, &settings);
+        let extra = request["@extra"].as_str().unwrap_or("").to_string();
+        self.pending_chat_notify.insert(extra, (chat_id, settings));
+        Effect::send(vec![request])
+    }
+
+    fn set_scope_muted(&mut self, scope: NotificationScope, muted: bool) -> Effect {
+        if !self.ready || self.failed {
+            return notification_unavailable();
+        }
+        let mut settings = self
+            .scopes
+            .get(&scope)
+            .cloned()
+            .unwrap_or_else(ScopeNotificationState::tdlib_default);
+        settings.mute_for = crate::notify::mute_forever(muted);
+        self.send_scope_settings(scope, settings)
+    }
+
+    fn set_scope_show_preview(&mut self, scope: NotificationScope, show_preview: bool) -> Effect {
+        if !self.ready || self.failed {
+            return notification_unavailable();
+        }
+        let mut settings = self
+            .scopes
+            .get(&scope)
+            .cloned()
+            .unwrap_or_else(ScopeNotificationState::tdlib_default);
+        settings.show_preview = show_preview;
+        self.send_scope_settings(scope, settings)
+    }
+
+    fn send_scope_settings(
+        &mut self,
+        scope: NotificationScope,
+        settings: ScopeNotificationState,
+    ) -> Effect {
+        let request = set_scope_notification_settings(scope, &settings);
+        let extra = request["@extra"].as_str().unwrap_or("").to_string();
+        self.pending_scope_notify.insert(extra, (scope, settings));
+        Effect::send(vec![request])
+    }
+
+    fn take_notification_ok(&mut self, extra: &str) -> Option<Effect> {
+        if let Some((chat_id, settings)) = self.pending_chat_notify.remove(extra) {
+            self.chat_notifications.insert(chat_id, settings);
+            return Some(Effect::ui(self.mute_ui()));
+        }
+        if let Some((scope, settings)) = self.pending_scope_notify.remove(extra) {
+            self.scopes.insert(scope, settings);
+            let mut ui = vec![self.scopes_update()];
+            ui.extend(self.mute_ui());
+            return Some(Effect::ui(ui));
+        }
+        None
+    }
+
+    fn on_chat_notification_settings(&mut self, event: &Value) -> Effect {
+        let Some(chat_id) = json_i64(&event["chat_id"]) else {
+            return Effect::none();
+        };
+        let Some(settings) = parse_chat_notification_settings(&event["notification_settings"])
+        else {
+            return Effect::none();
+        };
+        self.chat_notifications.insert(chat_id, settings);
+        Effect::ui(self.mute_ui())
+    }
+
+    fn on_scope_notification_settings(&mut self, event: &Value) -> Effect {
+        let parsed = if event["@type"].as_str() == Some("updateScopeNotificationSettings") {
+            NotificationScope::from_type(&event["scope"]).and_then(|scope| {
+                parse_scope_notification_settings(&event["notification_settings"])
+                    .map(|settings| (scope, settings))
+            })
+        } else {
+            scope_from_extra(event["@extra"].as_str().unwrap_or("")).and_then(|scope| {
+                parse_scope_notification_settings(event).map(|settings| (scope, settings))
+            })
+        };
+        let Some((scope, settings)) = parsed else {
+            return Effect::none();
+        };
+        self.scopes.insert(scope, settings);
+        let mut ui = vec![self.scopes_update()];
+        ui.extend(self.mute_ui());
+        Effect::ui(ui)
+    }
+
+    fn scopes_update(&self) -> UiUpdate {
+        let scopes = NotificationScope::all()
+            .into_iter()
+            .filter_map(|scope| {
+                self.scopes
+                    .get(&scope)
+                    .map(|settings| settings.to_public(scope))
+            })
+            .collect();
+        UiUpdate::NotificationScopes(scopes)
+    }
+
+    fn mute_ui(&self) -> Vec<UiUpdate> {
+        let mut ui = vec![self.chat_list_update()];
+        if !self.search_query.is_empty() {
+            ui.push(self.search_update());
+        }
+        ui
+    }
+
+    fn with_mute(&self, mut chat: ChatItem) -> ChatItem {
+        chat.muted = self.chat_is_muted(chat.id);
+        chat
+    }
+
+    fn chat_is_muted(&self, chat_id: i64) -> bool {
+        chat_is_muted(
+            self.chat_notifications.get(&chat_id),
+            self.peers.get(&chat_id).map(|peer| peer_scope(*peer)),
+            &self.scopes,
+        )
+    }
+
     fn request_chats(&mut self) -> Effect {
         if self.get_chats_sent >= 3 {
             return Effect::ui(vec![self.chat_list_update()]);
@@ -1854,6 +2068,9 @@ impl Shell {
             items.sort_by(|a, b| b.order.cmp(&a.order).then(b.id.cmp(&a.id)));
             items
         };
+        for chat in &mut items {
+            chat.muted = self.chat_is_muted(chat.id);
+        }
         items.truncate(limit);
         UiUpdate::ChatList(items)
     }
@@ -3267,6 +3484,26 @@ fn profile_unavailable() -> Effect {
     Effect::ui(vec![UiUpdate::Status(
         "Profile is available after TDLib is ready.".into(),
     )])
+}
+
+fn notification_unavailable() -> Effect {
+    Effect::ui(vec![UiUpdate::Status(
+        "Notifications are available after TDLib is ready.".into(),
+    )])
+}
+
+fn peer_scope(peer: ChatPeer) -> NotificationScope {
+    match peer {
+        ChatPeer::User(_) | ChatPeer::Secret(_) => NotificationScope::Private,
+        ChatPeer::BasicGroup(_) => NotificationScope::Group,
+        ChatPeer::Supergroup { is_channel, .. } => {
+            if is_channel {
+                NotificationScope::Channel
+            } else {
+                NotificationScope::Group
+            }
+        }
+    }
 }
 
 fn chat_peer(kind: &Value) -> Option<ChatPeer> {
@@ -5348,6 +5585,243 @@ mod tests {
             .any(|request| request["@type"] == "getUserFullInfo" && request["user_id"] == 8));
         assert_eq!(profile_in(&effect).kind, ProfileKind::Secret);
     }
+
+    fn chat_muted(effect: &Effect, chat_id: i64) -> bool {
+        effect
+            .ui
+            .iter()
+            .rev()
+            .find_map(|update| match update {
+                UiUpdate::ChatList(chats) => chats
+                    .iter()
+                    .find(|chat| chat.id == chat_id)
+                    .map(|chat| chat.muted),
+                _ => None,
+            })
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn notification_commands_wait_until_ready_and_do_not_close() {
+        let mut shell = Shell::new(cfg());
+        for command in [
+            ShellCommand::LoadNotificationSettings,
+            ShellCommand::SetChatMuted {
+                chat_id: 5,
+                muted: true,
+            },
+            ShellCommand::SetScopeMuted {
+                scope: NotificationScope::Private,
+                muted: true,
+            },
+            ShellCommand::SetScopeShowPreview {
+                scope: NotificationScope::Group,
+                show_preview: false,
+            },
+        ] {
+            let effect = shell.on_command(command);
+            assert!(effect.send.is_empty());
+            assert!(effect.ui.iter().any(|update| {
+                matches!(update, UiUpdate::Status(text) if text.contains("after TDLib is ready"))
+            }));
+            assert!(!shell.failed);
+        }
+    }
+
+    #[test]
+    fn ready_loads_scope_notification_settings() {
+        let mut shell = Shell::new(cfg());
+        let effect = drive(
+            &mut shell,
+            json!({
+                "@type": "updateAuthorizationState",
+                "authorization_state": {"@type": "authorizationStateWaitTdlibParameters"}
+            }),
+        );
+        assert!(effect
+            .send
+            .iter()
+            .all(|request| request["@type"] != "getScopeNotificationSettings"));
+        drive(
+            &mut shell,
+            json!({
+                "@type": "updateAuthorizationState",
+                "authorization_state": {"@type": "authorizationStateReady"}
+            }),
+        );
+        let effect = shell.on_command(ShellCommand::LoadNotificationSettings);
+        assert_eq!(effect.send.len(), 3);
+        assert!(effect.send.iter().all(|request| {
+            request["@type"] == "getScopeNotificationSettings" && request["@type"] != "logOut"
+        }));
+        assert_eq!(
+            effect.send[0]["scope"]["@type"],
+            "notificationSettingsScopePrivateChats"
+        );
+    }
+
+    #[test]
+    fn scope_and_chat_mute_round_trip_through_tdlib() {
+        let mut shell = Shell::new(cfg());
+        ready(&mut shell);
+        drive(
+            &mut shell,
+            json!({
+                "@type": "updateNewChat",
+                "chat": {
+                    "id": 5,
+                    "title": "Ada",
+                    "type": {"@type": "chatTypeBasicGroup", "basic_group_id": 9},
+                    "positions": [{
+                        "list": {"@type": "chatListMain"},
+                        "order": "10"
+                    }],
+                    "notification_settings": {
+                        "@type": "chatNotificationSettings",
+                        "use_default_mute_for": true,
+                        "mute_for": 0,
+                        "use_default_sound": false,
+                        "sound_id": 7,
+                        "use_default_show_preview": false,
+                        "show_preview": false,
+                        "use_default_mute_stories": true,
+                        "mute_stories": false,
+                        "use_default_story_sound": true,
+                        "story_sound_id": 0,
+                        "use_default_show_story_poster": true,
+                        "show_story_poster": true,
+                        "use_default_disable_pinned_message_notifications": true,
+                        "disable_pinned_message_notifications": false,
+                        "use_default_disable_mention_notifications": true,
+                        "disable_mention_notifications": false
+                    }
+                }
+            }),
+        );
+        let effect = drive(
+            &mut shell,
+            json!({
+                "@type": "scopeNotificationSettings",
+                "mute_for": 120,
+                "sound_id": 4,
+                "show_preview": true,
+                "use_default_mute_stories": true,
+                "mute_stories": false,
+                "story_sound_id": -1,
+                "show_story_poster": true,
+                "disable_pinned_message_notifications": false,
+                "disable_mention_notifications": true,
+                "@extra": "getScopeNotificationSettings:group"
+            }),
+        );
+        assert!(
+            chat_muted(&effect, 5),
+            "default mute follows the group scope"
+        );
+        let UiUpdate::NotificationScopes(scopes) = effect
+            .ui
+            .iter()
+            .find(|update| matches!(update, UiUpdate::NotificationScopes(_)))
+            .unwrap()
+        else {
+            panic!("missing scopes");
+        };
+        assert_eq!(scopes.len(), 1);
+        assert_eq!(scopes[0].scope, NotificationScope::Group);
+        assert!(scopes[0].muted);
+        assert!(scopes[0].show_preview);
+
+        let effect = shell.on_command(ShellCommand::SetChatMuted {
+            chat_id: 5,
+            muted: true,
+        });
+        let settings = &effect.send[0]["notification_settings"];
+        assert_eq!(effect.send[0]["@type"], "setChatNotificationSettings");
+        assert_eq!(settings["use_default_mute_for"], false);
+        assert_eq!(settings["mute_for"], crate::notify::MUTE_FOREVER_SECONDS);
+        assert_eq!(settings["sound_id"], 7);
+        assert_eq!(settings["show_preview"], false);
+        assert_eq!(settings["use_default_sound"], false);
+
+        let effect = drive(
+            &mut shell,
+            json!({
+                "@type": "ok",
+                "@extra": "setChatNotificationSettings:5"
+            }),
+        );
+        assert!(chat_muted(&effect, 5));
+        assert!(!shell.failed);
+
+        let effect = drive(
+            &mut shell,
+            json!({
+                "@type": "error",
+                "code": 400,
+                "message": "Chat can't be muted",
+                "@extra": "setChatNotificationSettings:5"
+            }),
+        );
+        assert!(!shell.failed);
+        assert!(effect.ui.iter().any(|update| {
+            matches!(
+                update,
+                UiUpdate::Status(text) if text == "Notification error 400: Chat can't be muted"
+            )
+        }));
+        assert!(effect
+            .ui
+            .iter()
+            .all(|update| !matches!(update, UiUpdate::Fatal(_))));
+
+        let effect = shell.on_command(ShellCommand::SetScopeShowPreview {
+            scope: NotificationScope::Group,
+            show_preview: false,
+        });
+        assert_eq!(effect.send[0]["@type"], "setScopeNotificationSettings");
+        assert_eq!(
+            effect.send[0]["scope"]["@type"],
+            "notificationSettingsScopeGroupChats"
+        );
+        assert_eq!(effect.send[0]["notification_settings"]["mute_for"], 120);
+        assert_eq!(effect.send[0]["notification_settings"]["sound_id"], 4);
+        assert_eq!(
+            effect.send[0]["notification_settings"]["show_preview"],
+            false
+        );
+        assert_eq!(
+            effect.send[0]["notification_settings"]["disable_mention_notifications"],
+            true
+        );
+
+        let effect = drive(
+            &mut shell,
+            json!({
+                "@type": "updateChatNotificationSettings",
+                "chat_id": 5,
+                "notification_settings": {
+                    "@type": "chatNotificationSettings",
+                    "use_default_mute_for": false,
+                    "mute_for": 0
+                }
+            }),
+        );
+        assert!(!chat_muted(&effect, 5));
+
+        let effect = shell.on_command(ShellCommand::SetScopeMuted {
+            scope: NotificationScope::Private,
+            muted: true,
+        });
+        assert_eq!(
+            effect.send[0]["notification_settings"]["mute_for"],
+            crate::notify::MUTE_FOREVER_SECONDS
+        );
+        assert_eq!(effect.send[0]["notification_settings"]["sound_id"], -1);
+        assert_eq!(
+            effect.send[0]["@extra"],
+            "setScopeNotificationSettings:private"
+        );
+    }
 }
 
-// PORT STATUS: module=M12 confidence=high todos=0
+// PORT STATUS: module=M13 confidence=high todos=0

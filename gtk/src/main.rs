@@ -596,7 +596,8 @@ fn apply_update(ui: &Rc<Ui>, client: &Rc<LiveClient>, update: UiUpdate) {
         UiUpdate::SearchResults { .. }
         | UiUpdate::Contacts(_)
         | UiUpdate::OpenChat(_)
-        | UiUpdate::Profile(_) => {}
+        | UiUpdate::Profile(_)
+        | UiUpdate::NotificationScopes(_) => {}
     }
 }
 

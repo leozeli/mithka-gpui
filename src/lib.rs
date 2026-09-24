@@ -9,6 +9,7 @@
 mod database;
 mod driver;
 mod format;
+mod notify;
 mod run;
 mod shell;
 mod tdjson;
@@ -18,7 +19,7 @@ pub use driver::{explain_error, set_tdlib_parameters, SessionConfig};
 pub use format::{is_http_url, list_time, message_time};
 pub use run::{run, RunOptions};
 pub use shell::{
-    ChatItem, ContactItem, FolderItem, LiveClient, MessageKind, Profile, ProfileKind, ShellCommand,
-    TextLink, TextMessage, UiUpdate,
+    ChatItem, ContactItem, FolderItem, LiveClient, MessageKind, NotificationScope, Profile,
+    ProfileKind, ScopeNotification, ShellCommand, TextLink, TextMessage, UiUpdate,
 };
 pub use tdjson::{LoadError, TdJson};
