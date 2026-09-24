@@ -29,8 +29,8 @@ Read this whole document before writing any code.
 - The kit's dual-translation bakeoff is invalid. Stress-test this document
   with adversarial review and disposable module runs (`prompts/03-stress-test.md`).
   Throw the disposable run away; keep the rule amendments.
-- A human kicks the next manifest row. Do not start `in_progress` work owned
-  by another agent (contacts and global search).
+- A human kicks the next manifest row. The next module is profile (M12).
+  Contacts and global search (M11) are `done`.
 - First pass of a new module optimizes for behavioral fidelity on its
   scenarios. Mark a known slow-but-faithful path `PERF(port):` with one line
   on the fast version, and move on.
