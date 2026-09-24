@@ -5,11 +5,12 @@
 //! snapshots the worker sends.
 //!
 //! The window is built with [gpui-kit](https://github.com/longbridge/gpui-kit):
-//! `Root` for theme and window chrome, a local-groups column, a Telegram
-//! folder column (or feed sources when Subscriptions is selected), chat rows
-//! with `Avatar` and `Badge`, `Message` / `Bubble` for the transcript, `Link`
-//! for http(s) entities, and `Input` plus a primary `Button` for the composer.
-//! Subscriptions are local RSS/Atom items, not TDLib chats. The transcript itself is
+//! `Root` for theme and window chrome, a local-groups column, chat rows with
+//! `Avatar` and `Badge`, `Message` / `Bubble` for the transcript, `Link` for
+//! http(s) entities, and `Input` plus a primary `Button` for the composer.
+//! All chats and Contacts hide the middle column. A local group shows only
+//! that group's nested Telegram folders there. Subscriptions uses it for feed
+//! sources. Subscriptions are local RSS/Atom items, not TDLib chats. The transcript itself is
 //! GPUI's virtual list — the same list `MessageScroller` wraps — so a scroll
 //! to the first row can ask TDLib for an older page. `MessageScroller` does
 //! not expose that offset. Charts, docks, sidebars, tables, and forms from
@@ -544,7 +545,12 @@ impl ShellView {
     }
 
     fn select_group(&mut self, group_id: Option<String>, cx: &mut gpui_kit::Context<Self>) {
-        if !self.show_feeds && !self.show_contacts && self.group_id == group_id {
+        let same = !self.show_feeds && !self.show_contacts && self.group_id == group_id;
+        if same {
+            // All chats must stay on the main list even if a folder was left selected.
+            if group_id.is_none() && self.folder.is_some() {
+                self.show_main_list(cx);
+            }
             return;
         }
         self.show_feeds = false;
@@ -553,6 +559,15 @@ impl ShellView {
         self.group_id = group_id.clone();
         if let Some(id) = group_id {
             self.focus_nested_folder(&id, cx);
+        } else {
+            self.show_main_list(cx);
+        }
+    }
+
+    /// All chats is the TDLib main list. Drop a nested folder once that column is gone.
+    fn show_main_list(&mut self, cx: &mut gpui_kit::Context<Self>) {
+        if self.folder.is_some() {
+            self.select_folder(None, cx);
         } else {
             cx.notify();
         }
@@ -993,6 +1008,7 @@ impl ShellView {
             self.renaming_group = false;
         } else if let Some(id) = self.local_groups.create(&name) {
             self.show_feeds = false;
+            self.hide_contacts();
             self.group_id = Some(id);
         }
         self.persist_groups();
@@ -1027,7 +1043,7 @@ impl ShellView {
             self.group_id = None;
             self.renaming_group = false;
             self.persist_groups();
-            cx.notify();
+            self.show_main_list(cx);
         }
     }
 
@@ -1138,11 +1154,16 @@ impl Render for ShellView {
         let background = theme.background;
         let foreground = theme.foreground;
         let can_send = self.ready && self.open_chat.is_some();
-        let middle = if self.show_feeds {
-            self.sources_pane(cx, border, muted).into_any_element()
-        } else {
-            self.folders_pane(cx, border, muted).into_any_element()
-        };
+        let middle =
+            match middle_column(self.show_feeds, self.show_contacts, self.group_id.is_some()) {
+                MiddleColumn::Feeds => {
+                    Some(self.sources_pane(cx, border, muted).into_any_element())
+                }
+                MiddleColumn::NestedFolders => {
+                    Some(self.folders_pane(cx, border, muted).into_any_element())
+                }
+                MiddleColumn::Hidden => None,
+            };
         let list = if self.show_feeds {
             self.items_pane(cx, border, muted).into_any_element()
         } else if self.show_contacts {
@@ -1164,9 +1185,30 @@ impl Render for ShellView {
             .text_color(foreground)
             .text_size(px(14.))
             .child(self.groups_pane(cx, border, muted))
-            .child(middle)
+            .children(middle)
             .child(list)
             .child(detail)
+    }
+}
+
+/// Which middle column the shell paints, if any.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MiddleColumn {
+    /// All chats and Contacts: groups rail and the list only.
+    Hidden,
+    /// A local group: that group's nested folders, plus Attach / Remove.
+    NestedFolders,
+    /// Subscriptions: feed sources.
+    Feeds,
+}
+
+fn middle_column(show_feeds: bool, show_contacts: bool, group_selected: bool) -> MiddleColumn {
+    if show_feeds {
+        MiddleColumn::Feeds
+    } else if group_selected && !show_contacts {
+        MiddleColumn::NestedFolders
+    } else {
+        MiddleColumn::Hidden
     }
 }
 
@@ -2029,10 +2071,6 @@ impl ShellView {
                     rows.push(self.folder_row(folder, false, fill, cx));
                 }
             }
-        } else {
-            for folder in self.known_folders() {
-                rows.push(self.folder_row(folder, true, fill, cx));
-            }
         }
         let can_remove = in_group && nested.iter().any(|folder| folder.matches(self.folder));
 
@@ -2042,10 +2080,7 @@ impl ShellView {
             .flex_shrink_0()
             .border_r_1()
             .border_color(border)
-            .child(column_title(
-                if in_group { "In group" } else { "Folders" },
-                muted,
-            ))
+            .child(column_title("In group", muted))
             .child(
                 v_flex()
                     .id("telegram-folders")
@@ -2858,5 +2893,28 @@ mod photo_fit_tests {
         bytes.extend_from_slice(&1280u32.to_be_bytes());
         bytes.extend_from_slice(&800u32.to_be_bytes());
         assert_eq!(png_pixel_size(&bytes), Some((1280, 800)));
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::{middle_column, MiddleColumn};
+
+    #[test]
+    fn all_chats_and_contacts_hide_the_folders_column() {
+        assert_eq!(middle_column(false, false, false), MiddleColumn::Hidden);
+        assert_eq!(middle_column(false, true, false), MiddleColumn::Hidden);
+        // Contacts wins over a stale group id so folder rows are not painted.
+        assert_eq!(middle_column(false, true, true), MiddleColumn::Hidden);
+    }
+
+    #[test]
+    fn local_group_shows_nested_folders_and_subscriptions_keep_feeds() {
+        assert_eq!(
+            middle_column(false, false, true),
+            MiddleColumn::NestedFolders
+        );
+        assert_eq!(middle_column(true, false, false), MiddleColumn::Feeds);
+        assert_eq!(middle_column(true, true, true), MiddleColumn::Feeds);
     }
 }

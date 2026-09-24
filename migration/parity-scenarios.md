@@ -119,14 +119,18 @@ for pixel.
 
 - **id:** S07
 - **area:** tg-folders (M03)
-- **steps:** From All chats (no local group selected), click a Telegram folder,
-  then click All.
-- **expected (Flutter / TDLib):** Folder chips come from `updateChatFolders`.
+- **steps:** With no local group selected, confirm the folders column is
+  hidden and the chat column is the main list. Select a local group, attach a
+  Telegram folder if it is not already nested, and click that folder. Then
+  click All chats.
+- **expected (Flutter / TDLib):** Folder names come from `updateChatFolders`.
   TDLib 1.8.67 does not offer `getChatFolders`, so the client never sends it.
   All is the main list. A folder calls `loadChats` / `getChats` with
   `chatListFolder` and lists only chats in that folder.
-- **how to check on gpui:** The middle column lists those folders. The chat
-  column follows the selected folder. All restores the main list.
+- **how to check on gpui:** All chats hides the folders column and lists the
+  main chat list. Inside a local group the middle column lists that group's
+  nested folders (and Attach). The chat column follows the selected nested
+  folder. All chats hides the column again and restores the main list.
 
 ### S08 — Local folder group nesting
 
@@ -141,10 +145,11 @@ for pixel.
   with N from `updateChatFolders`. Choosing the nested folder shows that
   folder's chats.
 - **how to check on gpui:** The file is `local-groups.json`, schema version 2,
-  keyed by the canonical `--database` path. The middle column lists only
-  folders inside the selected group. Attach adds and selects. Remove drops the
-  selected folder. All chats clears the group and shows every Telegram folder
-  again.
+  keyed by the canonical `--database` path. The middle column appears only
+  while that group is selected, and lists only folders inside it. Attach adds
+  and selects. Remove drops the selected folder. All chats clears the group,
+  hides the folders column, and shows the main list. It does not list every
+  Telegram folder.
 
 ### S09 — RSS add, refresh, open
 
@@ -219,20 +224,22 @@ for pixel.
 - **id:** S13
 - **area:** contacts-search (M11)
 - **steps:** In the groups column, click Contacts. Read the list. Click a
-  contact. Then click All chats, or a Telegram folder.
+  contact. Then click All chats, or a local group.
 - **expected (Flutter / TDLib):** Opening the list sends `getContacts`.
   `updateUser` keeps it current (`is_contact` adds or removes a row;
   `usernames.active_usernames` is the `@username`; `profile_photo.small` is
   the avatar once `downloadFile` has a local path). A click sends
   `createPrivateChat` with `force` false, then opens that private chat
   (same `openChat` path as S03). There is no add-by-phone form. Choosing All
-  chats or a folder leaves the contacts list and shows chats again.
+  chats or a local group leaves the contacts list and shows chats again.
 - **how to check on gpui:** The row is Contacts, with the `user-group` icon.
-  Each row is an avatar (initials until the small photo is local), a display
-  name, and `@username` when TDLib has one. The conversation opens for that
-  person. A `getContacts` or `createPrivateChat` error stays on the status
-  line and does not close the session. All chats or a folder returns to the
-  chat list.
+  The folders column is hidden (same width as All chats). No folder chips or
+  rows are painted. Each contact row is an avatar (initials until the small
+  photo is local), a display name, and `@username` when TDLib has one. The
+  conversation opens for that person. A `getContacts` or `createPrivateChat`
+  error stays on the status line and does not close the session. All chats
+  returns to the main chat list. A local group shows that group's nested
+  folders and chats.
 
 ## Upcoming
 

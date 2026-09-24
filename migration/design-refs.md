@@ -3,9 +3,10 @@
 Curated UI inspiration for `mithka-gpui`. These sites train the eye. They are
 not a second design system.
 
-Use them for the live window: a three-pane desktop layout (local groups,
-Telegram folders or feed sources, chat list) plus the open conversation, and
-the RSS timeline when Subscriptions is selected. Prefer desktop and web
+Use them for the live window: groups rail plus the list on All chats and
+Contacts (no folders column), a middle column of nested folders only when a
+local group is selected, or feed sources when Subscriptions is selected, plus
+the open conversation and the RSS timeline. Prefer desktop and web
 multi-column chat and reader flows.
 
 Study these microinteractions: sent/read ticks, the independent photo window,
@@ -41,4 +42,4 @@ the repo root remains the name map.
 
 Skip mobile-fullscreen galleries and landing-page CTA galleries. Full-screen
 phone flows, story viewers, and marketing hero or pricing pages do not map onto
-this three-pane desktop shell. Do not import their iconography.
+this desktop shell. Do not import their iconography.
