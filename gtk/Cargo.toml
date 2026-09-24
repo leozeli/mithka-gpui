@@ -1,0 +1,15 @@
+[package]
+name = "mithka-gtk"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Validation GTK4 spike for a copied Mithka TDLib database. Not the product UI."
+
+[[bin]]
+name = "mithka-gtk"
+path = "src/main.rs"
+
+[dependencies]
+mithka-tdlib = { path = ".." }
+clap = { version = "4", features = ["derive", "env"] }
+gtk4 = { version = "0.9", features = ["v4_14"] }

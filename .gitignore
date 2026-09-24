@@ -1,0 +1,29 @@
+/target/
+**/*.rs.bk
+
+# Secrets. Placeholders live only in .env.example.
+.env
+.env.*
+!.env.example
+run.env
+*.env
+
+# Native TDLib libraries. Supply locally; never commit.
+libtdjson.so
+libtdjson.so.*
+libtdjson.dylib
+tdjson.dll
+
+# TDLib session and database directories and files.
+td.binlog
+td.binlog.*
+*.binlog
+/tdlib/
+/session-copy/
+/sessions/
+/mithka-tdlib-copy/
+db.sqlite
+db.sqlite-*
+
+squashfs-root/
+*.AppImage

@@ -1,0 +1,19 @@
+[package]
+name = "mithka-gpui"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "GPUI desktop shell for a copied Mithka TDLib database"
+
+[[bin]]
+name = "mithka-gpui"
+path = "src/main.rs"
+
+[dependencies]
+mithka-tdlib = { path = ".." }
+mithka-rss = { path = "../rss" }
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# gpui-kit re-exports gpui-pre 0.3.x. Do not also depend on crates.io gpui 0.2.
+gpui-kit = "0.6"
