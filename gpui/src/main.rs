@@ -32,9 +32,10 @@ use gpui_kit::{
 };
 use mithka_rss::{store_path as subscriptions_path, FeedClient, FeedEvent, SubscriptionStore};
 use mithka_tdlib::{
-    inspect_database, is_http_url, list_time, message_time, ChatItem, FolderItem, LiveClient,
-    MessageKind, SessionConfig, ShellCommand, TdJson, TextLink, TextMessage, UiUpdate,
+    inspect_database, is_http_url, list_time, message_time, ChatItem, ContactItem, FolderItem,
+    LiveClient, MessageKind, SessionConfig, ShellCommand, TdJson, TextLink, TextMessage, UiUpdate,
 };
+use std::collections::HashSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -299,6 +300,15 @@ struct ShellView {
     composer: Entity<InputState>,
     /// Kept so Enter on the composer stays subscribed for the life of the window.
     _composer_events: Subscription,
+    search: Entity<InputState>,
+    _search_events: Subscription,
+    /// Last query sent to TDLib. The field filters locally before that reply.
+    search_sent: String,
+    search_hits: Vec<ChatItem>,
+    /// Query the current [`Self::search_hits`] belong to.
+    search_echo: String,
+    show_contacts: bool,
+    contacts: Vec<ContactItem>,
     pins: PinLibrary,
     /// Subscriptions replaces the folder, chat, and conversation columns.
     show_feeds: bool,
@@ -338,6 +348,12 @@ impl ShellView {
                     this.commit_group_draft(window, cx);
                 }
             });
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search chats"));
+        let search_events = cx.subscribe_in(&search, window, |this, _input, event, _window, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.on_search_changed(cx);
+            }
+        });
         let feed_draft = cx.new(|cx| InputState::new(window, cx).placeholder("Feed URL"));
         let feed_events =
             cx.subscribe_in(&feed_draft, window, |this, _input, event, window, cx| {
@@ -369,6 +385,13 @@ impl ShellView {
             loading_older: false,
             composer,
             _composer_events: composer_events,
+            search,
+            _search_events: search_events,
+            search_sent: String::new(),
+            search_hits: Vec::new(),
+            search_echo: String::new(),
+            show_contacts: false,
+            contacts: Vec::new(),
             show_feeds: false,
             feeds: SubscriptionStore::load(feeds_path),
             feed_source: None,
@@ -484,11 +507,35 @@ impl ShellView {
                 self.messages = messages;
                 self.sync_transcript();
             }
+            UiUpdate::SearchResults { query, chats } => {
+                self.search_echo = query;
+                self.search_hits = chats;
+            }
+            UiUpdate::Contacts(contacts) => self.contacts = contacts,
+            UiUpdate::OpenChat(chat_id) => {
+                self.open_chat = Some(chat_id);
+                self.convo_title = self
+                    .chats
+                    .iter()
+                    .find(|chat| chat.id == chat_id)
+                    .map(|chat| chat.title.clone())
+                    .filter(|title| !title.is_empty() && title != "…")
+                    .unwrap_or_else(|| "Loading…".into());
+                self.messages.clear();
+                self.loading_older = false;
+                self.history_scroll_after = Instant::now() + Duration::from_millis(400);
+                self.sync_transcript();
+            }
         }
     }
 
     fn select_folder(&mut self, folder: Option<i32>, cx: &mut gpui_kit::Context<Self>) {
+        let leaving_contacts = self.show_contacts;
+        self.hide_contacts();
         if self.folder == folder {
+            if leaving_contacts {
+                cx.notify();
+            }
             return;
         }
         self.folder = folder;
@@ -497,10 +544,11 @@ impl ShellView {
     }
 
     fn select_group(&mut self, group_id: Option<String>, cx: &mut gpui_kit::Context<Self>) {
-        if !self.show_feeds && self.group_id == group_id {
+        if !self.show_feeds && !self.show_contacts && self.group_id == group_id {
             return;
         }
         self.show_feeds = false;
+        self.hide_contacts();
         self.renaming_group = false;
         self.group_id = group_id.clone();
         if let Some(id) = group_id {
@@ -591,9 +639,91 @@ impl ShellView {
             return;
         }
         self.show_feeds = true;
+        self.hide_contacts();
         self.group_id = None;
         self.renaming_group = false;
         cx.notify();
+    }
+
+    fn hide_contacts(&mut self) {
+        if self.show_contacts
+            && self.search_sent.is_empty()
+            && self.ready
+            && (self.status.ends_with(" contacts")
+                || self.status.starts_with("Contacts ")
+                || self.status.starts_with("Opening chat"))
+        {
+            self.status = "Ready".into();
+        }
+        self.show_contacts = false;
+    }
+
+    fn select_contacts(&mut self, cx: &mut gpui_kit::Context<Self>) {
+        if self.show_contacts {
+            return;
+        }
+        self.show_contacts = true;
+        self.show_feeds = false;
+        self.group_id = None;
+        self.renaming_group = false;
+        self.client.send(ShellCommand::LoadContacts);
+        cx.notify();
+    }
+
+    fn on_search_changed(&mut self, cx: &mut gpui_kit::Context<Self>) {
+        let query = self.search.read(cx).value().trim().to_string();
+        if query == self.search_sent {
+            cx.notify();
+            return;
+        }
+        self.search_sent = query.clone();
+        if query.is_empty() {
+            self.search_hits.clear();
+            self.search_echo.clear();
+        }
+        self.client.send(ShellCommand::Search(query));
+        cx.notify();
+    }
+
+    fn open_contact(
+        &mut self,
+        user_id: i64,
+        _window: &mut Window,
+        cx: &mut gpui_kit::Context<Self>,
+    ) {
+        if let Some(contact) = self
+            .contacts
+            .iter()
+            .find(|contact| contact.user_id == user_id)
+        {
+            self.convo_title = contact.name.clone();
+        }
+        self.client.send(ShellCommand::OpenContact(user_id));
+        cx.notify();
+    }
+
+    /// Local title matches, then TDLib hits that are not already in that set.
+    fn search_rows(&self, cx: &gpui_kit::Context<Self>) -> (Vec<ChatItem>, Vec<ChatItem>) {
+        let query = self.search.read(cx).value().trim().to_string();
+        let visible = self.shown_chats();
+        if query.is_empty() {
+            return (visible, Vec::new());
+        }
+        let needle = query.to_lowercase();
+        let local: Vec<ChatItem> = visible
+            .into_iter()
+            .filter(|chat| chat.title.to_lowercase().contains(&needle))
+            .collect();
+        let mut seen: HashSet<i64> = local.iter().map(|chat| chat.id).collect();
+        let mut extra = Vec::new();
+        if self.search_echo == query {
+            for chat in &self.search_hits {
+                if seen.insert(chat.id) {
+                    extra.push(chat.clone());
+                }
+            }
+        }
+        (local, extra)
     }
 
     fn select_feed_source(&mut self, source_id: Option<String>, cx: &mut gpui_kit::Context<Self>) {
@@ -961,8 +1091,10 @@ impl ShellView {
         self.convo_title = self
             .chats
             .iter()
+            .chain(self.search_hits.iter())
             .find(|chat| chat.id == chat_id)
             .map(|chat| chat.title.clone())
+            .filter(|title| !title.is_empty() && title != "…")
             .unwrap_or_else(|| "Loading…".into());
         self.messages.clear();
         self.loading_older = false;
@@ -1013,6 +1145,8 @@ impl Render for ShellView {
         };
         let list = if self.show_feeds {
             self.items_pane(cx, border, muted).into_any_element()
+        } else if self.show_contacts {
+            self.contacts_pane(cx, border, muted).into_any_element()
         } else {
             self.chat_pane(cx, border, muted).into_any_element()
         };
@@ -1314,7 +1448,13 @@ impl ShellView {
                     .py_3()
                     .gap_1()
                     .child(div().text_size(px(16.)).child("Feed"))
-                    .child(div().text_size(px(12.)).text_color(muted).child(status)),
+                    .child(div().text_size(px(12.)).text_color(muted).child(status))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(muted)
+                            .child("Chat search is off in Subscriptions."),
+                    ),
             )
             .child(
                 v_flex()
@@ -1501,17 +1641,38 @@ impl ShellView {
         border: gpui_kit::Hsla,
         muted: gpui_kit::Hsla,
     ) -> impl IntoElement {
-        let shown = self.shown_chats();
-        let rows = if shown.is_empty() {
-            let empty = self.chat_list_empty();
-            vec![div()
-                .p_3()
-                .text_color(muted)
-                .child(empty.to_string())
-                .into_any_element()]
+        let (local, extra) = self.search_rows(cx);
+        let querying = !self.search.read(cx).value().trim().is_empty();
+        let mut rows = Vec::new();
+        if local.is_empty() && extra.is_empty() {
+            let empty = if querying {
+                "No chats match this search."
+            } else {
+                self.chat_list_empty()
+            };
+            rows.push(
+                div()
+                    .p_3()
+                    .text_color(muted)
+                    .child(empty.to_string())
+                    .into_any_element(),
+            );
         } else {
-            shown.iter().map(|chat| self.chat_row(chat, cx)).collect()
-        };
+            rows.extend(local.iter().map(|chat| self.chat_row(chat, cx)));
+            if !extra.is_empty() {
+                rows.push(
+                    div()
+                        .px_3()
+                        .pt_3()
+                        .pb_1()
+                        .text_size(px(12.))
+                        .text_color(muted)
+                        .child("Also found")
+                        .into_any_element(),
+                );
+                rows.extend(extra.iter().map(|chat| self.chat_row(chat, cx)));
+            }
+        }
 
         v_flex()
             .w(px(280.))
@@ -1523,8 +1684,24 @@ impl ShellView {
                 v_flex()
                     .px_3()
                     .py_3()
-                    .gap_1()
+                    .gap_2()
                     .child(div().text_size(px(16.)).child("Chats"))
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("focus-search")
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                        this.search.read(cx).focus_handle(cx).focus(window, cx);
+                                    }))
+                                    .child(hero(Icon::MagnifyingGlass, muted)),
+                            )
+                            .child(div().flex_1().min_w_0().child(Input::new(&self.search))),
+                    )
                     .child(
                         div()
                             .text_size(px(12.))
@@ -1543,6 +1720,119 @@ impl ShellView {
             )
     }
 
+    fn contacts_pane(
+        &self,
+        cx: &mut gpui_kit::Context<Self>,
+        border: gpui_kit::Hsla,
+        muted: gpui_kit::Hsla,
+    ) -> impl IntoElement {
+        let rows = if self.contacts.is_empty() {
+            let empty = if self.ready {
+                "No contacts yet."
+            } else {
+                "Waiting for TDLib before loading contacts."
+            };
+            vec![div()
+                .p_3()
+                .text_color(muted)
+                .child(empty.to_string())
+                .into_any_element()]
+        } else {
+            self.contacts
+                .iter()
+                .map(|contact| self.contact_row(contact, cx))
+                .collect()
+        };
+
+        v_flex()
+            .w(px(280.))
+            .h_full()
+            .flex_shrink_0()
+            .border_r_1()
+            .border_color(border)
+            .child(
+                v_flex()
+                    .px_3()
+                    .py_3()
+                    .gap_1()
+                    .child(div().text_size(px(16.)).child("Contacts"))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(muted)
+                            .child(self.status.clone()),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .id("contact-list")
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .overflow_y_scrollbar()
+                    .children(rows),
+            )
+    }
+
+    fn contact_row(
+        &self,
+        contact: &ContactItem,
+        cx: &mut gpui_kit::Context<Self>,
+    ) -> gpui_kit::AnyElement {
+        let user_id = contact.user_id;
+        let hover = cx.theme().secondary;
+        let muted = cx.theme().muted_foreground;
+        let username = if contact.username.is_empty() {
+            String::new()
+        } else {
+            format!("@{}", contact.username)
+        };
+        div()
+            .id(gpui_kit::SharedString::from(format!("contact-{user_id}")))
+            .w_full()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .min_h(px(56.))
+            .cursor_pointer()
+            .hover(move |style| style.bg(hover))
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                this.open_contact(user_id, window, cx);
+            }))
+            .child(named_avatar(&contact.name, contact.avatar.as_deref()))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(contact.name.clone()),
+                    )
+                    .when(!username.is_empty(), |col| {
+                        col.child(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .text_size(px(12.))
+                                .text_color(muted)
+                                .child(username),
+                        )
+                    }),
+            )
+            .into_any_element()
+    }
+
     fn groups_pane(
         &self,
         cx: &mut gpui_kit::Context<Self>,
@@ -1556,11 +1846,22 @@ impl ShellView {
                 "group-all",
                 "All chats",
                 Icon::ChatBubble,
-                !self.show_feeds && self.group_id.is_none(),
+                !self.show_feeds && !self.show_contacts && self.group_id.is_none(),
                 fill,
                 glyph,
                 cx.listener(|this, _: &ClickEvent, _window, cx| {
                     this.select_group(None, cx);
+                }),
+            ),
+            self.side_row(
+                "group-contacts",
+                "Contacts",
+                Icon::UserGroup,
+                self.show_contacts,
+                fill,
+                glyph,
+                cx.listener(|this, _: &ClickEvent, _window, cx| {
+                    this.select_contacts(cx);
                 }),
             ),
             self.side_row(
@@ -1577,7 +1878,9 @@ impl ShellView {
         ];
         for group in self.local_groups.groups() {
             let id = group.id.clone();
-            let selected = !self.show_feeds && self.group_id.as_deref() == Some(group.id.as_str());
+            let selected = !self.show_feeds
+                && !self.show_contacts
+                && self.group_id.as_deref() == Some(group.id.as_str());
             rows.push(self.side_row(
                 format!("group-{}", group.id),
                 group.name.clone(),
@@ -2100,21 +2403,21 @@ fn column_title(title: &str, muted: gpui_kit::Hsla) -> impl IntoElement {
     )
 }
 
-fn avatar_for(chat: &ChatItem) -> Avatar {
-    let title = if chat.title.is_empty() {
+fn named_avatar(name: &str, path: Option<&str>) -> Avatar {
+    let title = if name.is_empty() {
         "Untitled".to_string()
     } else {
-        chat.title.clone()
+        name.to_string()
     };
     let mut avatar = Avatar::new().name(title).with_size(Size::Size(px(36.)));
-    if let Some(path) = chat
-        .avatar
-        .as_deref()
-        .filter(|path| Path::new(path).is_file())
-    {
+    if let Some(path) = path.filter(|path| Path::new(path).is_file()) {
         avatar = avatar.src(PathBuf::from(path));
     }
     avatar
+}
+
+fn avatar_for(chat: &ChatItem) -> Avatar {
+    named_avatar(&chat.title, chat.avatar.as_deref())
 }
 
 fn avatar_with_badge(chat: &ChatItem) -> gpui_kit::AnyElement {

@@ -593,6 +593,7 @@ fn apply_update(ui: &Rc<Ui>, client: &Rc<LiveClient>, update: UiUpdate) {
             }
         }
         UiUpdate::Folders(folders) => refill_folders(ui, client, &folders),
+        UiUpdate::SearchResults { .. } | UiUpdate::Contacts(_) | UiUpdate::OpenChat(_) => {}
     }
 }
 

@@ -14,6 +14,7 @@ pub enum Icon {
     Check,
     Folder,
     Inbox,
+    MagnifyingGlass,
     MapPin,
     PaperAirplane,
     Pencil,
@@ -22,6 +23,7 @@ pub enum Icon {
     Rss,
     Squares,
     Trash,
+    UserGroup,
     /// Kept with the vendored set. The photo viewer uses the window title bar.
     #[allow(dead_code)]
     XMark,
@@ -35,6 +37,9 @@ impl Icon {
             Icon::Check => include_bytes!("../assets/heroicons/outline/check.svg"),
             Icon::Folder => include_bytes!("../assets/heroicons/outline/folder.svg"),
             Icon::Inbox => include_bytes!("../assets/heroicons/outline/inbox.svg"),
+            Icon::MagnifyingGlass => {
+                include_bytes!("../assets/heroicons/outline/magnifying-glass.svg")
+            }
             Icon::MapPin => include_bytes!("../assets/heroicons/outline/map-pin.svg"),
             Icon::PaperAirplane => {
                 include_bytes!("../assets/heroicons/outline/paper-airplane.svg")
@@ -45,6 +50,7 @@ impl Icon {
             Icon::Rss => include_bytes!("../assets/heroicons/outline/rss.svg"),
             Icon::Squares => include_bytes!("../assets/heroicons/outline/squares-2x2.svg"),
             Icon::Trash => include_bytes!("../assets/heroicons/outline/trash.svg"),
+            Icon::UserGroup => include_bytes!("../assets/heroicons/outline/user-group.svg"),
             Icon::XMark => include_bytes!("../assets/heroicons/outline/x-mark.svg"),
         }
     }

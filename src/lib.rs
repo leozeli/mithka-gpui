@@ -18,6 +18,7 @@ pub use driver::{explain_error, set_tdlib_parameters, SessionConfig};
 pub use format::{is_http_url, list_time, message_time};
 pub use run::{run, RunOptions};
 pub use shell::{
-    ChatItem, FolderItem, LiveClient, MessageKind, ShellCommand, TextLink, TextMessage, UiUpdate,
+    ChatItem, ContactItem, FolderItem, LiveClient, MessageKind, ShellCommand, TextLink,
+    TextMessage, UiUpdate,
 };
 pub use tdjson::{LoadError, TdJson};
