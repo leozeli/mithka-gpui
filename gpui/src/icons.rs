@@ -10,9 +10,12 @@ use gpui_kit::{px, svg, Hsla, IntoElement, Styled};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Icon {
     ArrowPath,
+    Bell,
+    BellSlash,
     ChatBubble,
     Check,
     ChevronLeft,
+    Cog6Tooth,
     Folder,
     Inbox,
     MagnifyingGlass,
@@ -35,9 +38,12 @@ impl Icon {
     fn bytes(self) -> &'static [u8] {
         match self {
             Icon::ArrowPath => include_bytes!("../assets/heroicons/outline/arrow-path.svg"),
+            Icon::Bell => include_bytes!("../assets/heroicons/outline/bell.svg"),
+            Icon::BellSlash => include_bytes!("../assets/heroicons/outline/bell-slash.svg"),
             Icon::ChatBubble => include_bytes!("../assets/heroicons/outline/chat-bubble-left.svg"),
             Icon::Check => include_bytes!("../assets/heroicons/outline/check.svg"),
             Icon::ChevronLeft => include_bytes!("../assets/heroicons/outline/chevron-left.svg"),
+            Icon::Cog6Tooth => include_bytes!("../assets/heroicons/outline/cog-6-tooth.svg"),
             Icon::Folder => include_bytes!("../assets/heroicons/outline/folder.svg"),
             Icon::Inbox => include_bytes!("../assets/heroicons/outline/inbox.svg"),
             Icon::MagnifyingGlass => {
