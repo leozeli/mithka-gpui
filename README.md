@@ -291,6 +291,10 @@ Ctrl-C exits 130 after `close`.
 
 `cargo test` builds a fake `libtdjson.so` (needs `gcc`) and checks the receive loop, the empty encryption key, and the lock / 401 / generation / phone messages. It does not contact Telegram.
 
+## Migration
+
+Behavioral parity with the Flutter app [leozeli/mithka](https://github.com/leozeli/mithka) is tracked as a redesign, not a file-by-file port. The module queue, rulebook, and scenario judge live in [`migration/README.md`](migration/README.md). Icon names stay in [`icons.md`](icons.md).
+
 ## 中文
 
 [leozeli/mithka-gpui](https://github.com/leozeli/mithka-gpui) 是产品主线：Linux 上的 Rust + GPUI（[longbridge/gpui-kit](https://github.com/longbridge/gpui-kit)）Telegram 桌面客户端，与 Flutter 仓库 [leozeli/mithka](https://github.com/leozeli/mithka) 分开，不包含 Flutter 源码。共享会话核心是 `mithka_tdlib`：用 `libloading` 加载本机的 `libtdjson.so`（TDLib 1.8.67 补丁版），读取**复制出来**的 TDLib 数据库。`mithka-gtk` 只作验证参考，不是产品 UI。仓库里没有密钥，只有 `.env.example` 的空占位。

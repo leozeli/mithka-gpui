@@ -1,0 +1,20 @@
+id	module	status	notes
+M01	auth-session	done	TDLib session reuse: copied database, empty encryption key, close not logOut, authorizationStateReady
+M02	chat-baseline	done	Unread, avatar, preview, history scroll, links, photo send and receive
+M03	tg-folders	done	Telegram folders from updateChatFolders; chatListFolder filter; no getChatFolders on TDLib 1.8.67
+M04	local-folder-groups	done	Three-pane local folder groups nesting Telegram folders (LocalGroup schema v2)
+M05	rss-mvp	done	Local RSS/Atom add, refresh, and open. Not a TDLib chat
+M06	local-pin	done	Local pin ordering ahead of TDLib order. Does not send toggleChatIsPinned
+M07	photo-hd-window	done	Photo opens in an independent HD window (WindowKind::Floating)
+M08	sent-read-checks	done	Outgoing Sent/Read from last_read_outbox_message_id
+M09	heroicons-outline	done	Partial Heroicons outline set under gpui/assets/heroicons/outline. Solids not vendored yet
+M10	icons-md	done	icons.md is already on main. Link it from the rulebook. Do not rewrite it
+M11	contacts-search	in_progress	Contacts and global search MVP. A cloud agent is already running this elsewhere. Do not implement it from this kit
+M12	profile	next	Profile page
+M13	settings-notifications	next	Settings shell and notifications
+M14	messaging-rich	next	Thicken messaging: stickers, voice, reply, forward
+M15	stories	later	Stories
+M16	calls	later	Calls
+M17	mini-apps	later	Mini Apps
+M18	communities-topics	later	Communities and topics
+M19	pro-business-ai	later	Pro, business, and AI extras
